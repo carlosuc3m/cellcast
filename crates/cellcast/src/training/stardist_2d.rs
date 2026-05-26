@@ -855,6 +855,11 @@ where
     // Create a normal Rust random-number generator for CPU-side sampling:
     // choosing images, crop positions, and augmentations.
     let mut rng = StdRng::seed_from_u64(config.seed);
+    // Validation should measure the same held-out patches every epoch, matching
+    // original StarDist's fixed `data_val`. We keep a separate deterministic
+    // seed so validation sampling does not depend on how many training batches
+    // have already been drawn.
+    let validation_seed = config.seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
 
     // Track the current learning rate and scheduler state. For example,
     // ReduceLROnPlateau needs to remember the best loss seen so far.
@@ -961,7 +966,7 @@ where
             if !valid.is_empty() {
                 // Convert the autodiff model into a plain inference model. This
                 // disables gradient tracking for validation and previews.
-                let valid_model = model.valid();
+                let valid_model: TrainableStarDist2D<<B as AutodiffBackend>::InnerBackend> = model.valid();
 
                 // Only run validation loss if the config asks for at least one
                 // validation batch.
@@ -972,14 +977,16 @@ where
                     let mut valid_total = 0.0;
                     let mut valid_prob = 0.0;
                     let mut valid_dist = 0.0;
+                    let mut validation_rng = StdRng::seed_from_u64(validation_seed);
 
-                    // Draw random validation batches. Validation uses the same
-                    // target generation code but disables training augmentations.
+                    // Draw the same validation batches every epoch. Validation
+                    // uses the same target generation code but disables
+                    // training augmentations.
                     for _ in 0..config.validation_steps {
                         // Build tensors with the inner non-autodiff backend
                         // because validation does not call backward.
-                        let batch = build_batch_2d::<B::InnerBackend>(
-                            valid, &config, &device, &mut rng, false,
+                        let batch: Batch2D<<B as AutodiffBackend>::InnerBackend> = build_batch_2d::<B::InnerBackend>(
+                            valid, &config, &device, &mut validation_rng, false,
                         )?;
 
                         // Forward pass for validation.
@@ -987,7 +994,7 @@ where
 
                         // Compute the same StarDist loss, but only for
                         // measurement. No gradients are computed from this loss.
-                        let losses = stardist_loss(
+                        let losses: LossTensors<<B as AutodiffBackend>::InnerBackend> = stardist_loss(
                             prob_pred,
                             dist_pred,
                             batch.prob,
