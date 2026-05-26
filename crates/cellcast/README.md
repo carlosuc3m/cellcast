@@ -112,6 +112,15 @@ cargo run --release -p cellcast --example train_stardist_2d_folder -- \
   --normalize-percentile
 ```
 
+For auto-detected dataset roots, omit the GT folder:
+
+```bash
+cargo run --release -p cellcast --example train_stardist_2d_folder -- \
+  dataset artifacts/stardist2d \
+  --epochs 400 --steps 100 --batch 4 --patch 256 --grid 1 \
+  --normalize-percentile
+```
+
 The loader accepts `.tif`, `.tiff`, `.png`, `.jpg`, `.jpeg`, `.bmp`, and PNM
 files. The masks must be instance labels with `0` as background. Grayscale masks
 are read as integer label ids; color masks can be read as color-coded instance

@@ -4,12 +4,13 @@ use std::io::{Error as IoError, ErrorKind};
 use std::path::PathBuf;
 
 use cellcast::training::io_2d::{
-    FolderDatasetOptions2D, ImageChannels2D, LabelColorMode2D,
-    load_training_samples_from_folders_with_options, split_train_valid_2d,
+    load_training_dataset_from_folder_with_options,
+    load_training_samples_from_folders_with_options, split_train_valid_2d, FolderDatasetOptions2D,
+    ImageChannels2D, LabelColorMode2D,
 };
 use cellcast::training::stardist_2d::{
-    LearningRateSchedule2D, Normalization2D, TrainingConfig2D, save_stardist_2d,
-    train_stardist_2d_cpu, train_stardist_2d_wgpu,
+    save_stardist_2d, train_stardist_2d_cpu, train_stardist_2d_wgpu, LearningRateSchedule2D,
+    Normalization2D, TrainingConfig2D,
 };
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -19,9 +20,19 @@ fn main() -> Result<(), Box<dyn Error>> {
         label_color_mode: args.label_color_mode,
     };
 
-    let samples =
-        load_training_samples_from_folders_with_options(&args.data_dir, &args.gt_dir, options)?;
-    let (train, valid) = split_train_valid_2d(samples, args.validation_fraction, args.seed)?;
+    let (train, valid) = if let Some(gt_dir) = args.gt_dir.as_ref() {
+        let samples =
+            load_training_samples_from_folders_with_options(&args.data_dir, gt_dir, options)?;
+        split_train_valid_2d(samples, args.validation_fraction, args.seed)?
+    } else {
+        let split = load_training_dataset_from_folder_with_options(
+            &args.data_dir,
+            options,
+            args.validation_fraction,
+            args.seed,
+        )?;
+        (split.train_samples, split.valid_samples)
+    };
     let channels = train
         .first()
         .or_else(|| valid.first())
@@ -72,7 +83,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 #[derive(Debug)]
 struct Args {
     data_dir: PathBuf,
-    gt_dir: PathBuf,
+    gt_dir: Option<PathBuf>,
     output_dir: PathBuf,
     cpu: bool,
     image_channels: ImageChannels2D,
@@ -96,14 +107,11 @@ struct Args {
 impl Args {
     fn parse() -> Result<Self, String> {
         let mut raw = env::args().skip(1);
-        let data_dir = raw.next().map(PathBuf::from).ok_or_else(usage)?;
-        let gt_dir = raw.next().map(PathBuf::from).ok_or_else(usage)?;
-        let output_dir = raw.next().map(PathBuf::from).ok_or_else(usage)?;
-
+        let mut positionals = Vec::new();
         let mut args = Args {
-            data_dir,
-            gt_dir,
-            output_dir,
+            data_dir: PathBuf::new(),
+            gt_dir: None,
+            output_dir: PathBuf::new(),
             cpu: false,
             image_channels: ImageChannels2D::Auto,
             label_color_mode: LabelColorMode2D::Auto,
@@ -123,8 +131,8 @@ impl Args {
             seed: 42,
         };
 
-        while let Some(flag) = raw.next() {
-            match flag.as_str() {
+        while let Some(arg) = raw.next() {
+            match arg.as_str() {
                 "--cpu" => args.cpu = true,
                 "--gray" | "--grayscale" => args.image_channels = ImageChannels2D::Grayscale,
                 "--rgb" => args.image_channels = ImageChannels2D::Rgb,
@@ -158,17 +166,44 @@ impl Args {
                 "--patch" => args.patch_size = parse_next(&mut raw, "--patch")?,
                 "--grid" => args.grid = parse_next(&mut raw, "--grid")?,
                 "--rays" => args.n_rays = parse_next(&mut raw, "--rays")?,
-                "--valid-frac" => args.validation_fraction = parse_next(&mut raw, "--valid-frac")?,
+                "--valid-frac" | "--val-frac" | "--validation-fraction" => {
+                    let value = parse_next(&mut raw, arg.as_str())?;
+                    args.validation_fraction = parse_validation_fraction(value)?;
+                }
+                "--valid-percent"
+                | "--val-percent"
+                | "--validation-percent"
+                | "--valid-percentage"
+                | "--val-percentage"
+                | "--validation-percentage" => {
+                    let value = parse_next(&mut raw, arg.as_str())?;
+                    args.validation_fraction = parse_validation_percent(value)?;
+                }
                 "--completion-crop" => {
                     args.completion_crop = parse_next(&mut raw, "--completion-crop")?
                 }
                 "--seed" => args.seed = parse_next(&mut raw, "--seed")?,
                 "--help" | "-h" => return Err(usage()),
-                _ => {
-                    return Err(format!("unknown argument '{flag}'\n\n{}", usage()));
+                _ if arg.starts_with('-') => {
+                    return Err(format!("unknown argument '{arg}'\n\n{}", usage()));
                 }
+                _ => positionals.push(PathBuf::from(arg)),
             }
         }
+
+        match positionals.as_slice() {
+            [dataset_dir, output_dir] => {
+                args.data_dir = dataset_dir.clone();
+                args.output_dir = output_dir.clone();
+            }
+            [data_dir, gt_dir, output_dir] => {
+                args.data_dir = data_dir.clone();
+                args.gt_dir = Some(gt_dir.clone());
+                args.output_dir = output_dir.clone();
+            }
+            _ => return Err(usage()),
+        }
+
         if let LearningRateSchedule2D::PolynomialDecay {
             min_learning_rate, ..
         } = args.lr_schedule
@@ -182,6 +217,7 @@ impl Args {
         if args.grid != 1 && args.grid != 2 {
             return Err("--grid must be 1 or 2".to_string());
         }
+        args.validation_fraction = parse_validation_fraction(args.validation_fraction)?;
         if !args.shape_completion && args.patch_size % 16 != 0 {
             return Err("--patch must be divisible by 16".to_string());
         }
@@ -196,6 +232,22 @@ impl Args {
         }
 
         Ok(args)
+    }
+}
+
+fn parse_validation_fraction(value: f32) -> Result<f32, String> {
+    if (0.0..1.0).contains(&value) {
+        Ok(value)
+    } else {
+        Err("validation fraction must be in [0, 1)".to_string())
+    }
+}
+
+fn parse_validation_percent(value: f32) -> Result<f32, String> {
+    if (0.0..100.0).contains(&value) {
+        Ok(value / 100.0)
+    } else {
+        Err("validation percentage must be in [0, 100)".to_string())
     }
 }
 
@@ -214,11 +266,15 @@ where
 
 fn usage() -> String {
     "Usage:
+  cargo run --release -p cellcast --example train_stardist_2d_folder -- <dataset_dir> <output_dir> [options]
   cargo run --release -p cellcast --example train_stardist_2d_folder -- <data_dir> <gt_dir> <output_dir> [options]
 
 Required:
-  <data_dir>      Folder with input images, for example dataset/data
-  <gt_dir>        Folder with instance masks, for example dataset/gt
+  <dataset_dir>   Dataset root. May contain train/ and val|valid|validation/
+                  splits, same-folder image/mask files, or data/gt-style
+                  subfolders.
+  <data_dir>      Explicit folder with input images, for example dataset/data
+  <gt_dir>        Explicit folder with instance masks, for example dataset/gt
   <output_dir>    Folder where model artifacts will be written
 
 Options:
@@ -241,7 +297,8 @@ Options:
   --patch N             Square patch size, divisible by 16. Default: 256
   --grid 1|2            StarDist prediction grid. Default: 1
   --rays N              Number of 2D rays. Default: 32
-  --valid-frac F        Validation fraction in [0, 1). Default: 0.15
+  --valid-frac F        Random validation fraction in [0, 1). Default: 0.15
+  --valid-percent P     Random validation percentage in [0, 100)
   --completion-crop N   Shape-completion crop. Default: 32
   --seed N              Default: 42"
         .to_string()
