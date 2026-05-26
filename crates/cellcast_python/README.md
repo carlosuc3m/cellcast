@@ -61,6 +61,19 @@ $ mamba activate myenv
 This will compile a *non-optimized* cellcast binaries. Pass the `--release` flag to
 compile optimized binaries (note that compilation time may take upwards of 10 minutes).
 
+### Build reusable wheels in GitHub Actions
+
+The `Build Python Wheels` workflow builds installable Python wheels for Linux,
+Windows, and macOS. Run it from GitHub's Actions tab or push to the
+`stardist-burn-training` branch. The combined `cellcast-wheelhouse` artifact can
+be downloaded and copied into another project.
+
+To install from a local wheelhouse without requiring Rust on the target machine:
+
+```bash
+python -m pip install --no-index --find-links ./vendor/wheels cellcast==0.2.1.dev0
+```
+
 ## Usage
 
 ### Using cellcast
