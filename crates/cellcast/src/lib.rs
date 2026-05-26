@@ -5,10 +5,13 @@
 //! ## Crate Status
 //!
 //! This crate is still under active development and it's API is not stable.
+#![recursion_limit = "256"]
+
 mod config;
 pub mod geometry;
 pub mod labeling;
 pub mod models;
 pub mod networks;
 pub mod process;
+pub mod training;
 pub mod utils;

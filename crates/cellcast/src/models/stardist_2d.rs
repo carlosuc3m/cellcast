@@ -250,11 +250,42 @@ fn prob_dist_to_labels_2d(
     let res_row: usize = pad_shape[0] / 2;
     let res_col: usize = pad_shape[1] / 2;
     let prob_arr = Array2::from_shape_vec((res_row, res_col), prob)
-        .expect("StarDist 2D object probabilites reshape failed.");
+        .expect("StarDist 2D object probabilities reshape failed.");
     let dist_arr = Array3::from_shape_vec((res_row, res_col, N_RAYS), dist)
         .expect("StarDist 2D radial distances reshape failed.");
-    // ensure all values in the dist array are at least 1e-3, prevents negative and/or zero
-    // distances
+    labels_from_prob_dist_2d(
+        prob_arr,
+        dist_arr,
+        prob_threshold,
+        nms_threshold,
+        [2, 2],
+        src_shape,
+    )
+}
+
+/// Process StarDist2D probability and distance arrays into instance labels.
+///
+/// This is the reusable post-processing boundary used by both pretrained
+/// inference and newly trained models. The neural network may use Burn-native
+/// channel-first tensors internally, but before calling this function its
+/// outputs should be converted to:
+///
+/// - `prob`: `[out_y, out_x]`
+/// - `dist`: `[out_y, out_x, n_rays]`
+///
+/// `grid` maps output coordinates back to source-image coordinates. For the
+/// current `cellcast` 2D StarDist architecture this is `[2, 2]`.
+pub fn labels_from_prob_dist_2d(
+    prob_arr: Array2<f32>,
+    dist_arr: Array3<f32>,
+    prob_threshold: f32,
+    nms_threshold: f32,
+    grid: [usize; 2],
+    src_shape: (usize, usize),
+) -> Array2<u64> {
+    let n_rays = dist_arr.dim().2;
+    // ensure all values in the dist array are at least 1e-3, prevents negative
+    // and/or zero distances
     let dist_arr = dist_arr.mapv(|v| v.max(1e-3));
     let mut valid_mask = manual_mask(&prob_arr, prob_threshold, false);
     border::clip_mask_border(&mut valid_mask.view_mut().into_dyn(), 2);
@@ -272,20 +303,23 @@ fn prob_dist_to_labels_2d(
     // positions
     let mut valid_prob =
         Array1::from_iter(valid_pos.axis_iter(Axis(0)).map(|v| prob_arr[[v[0], v[1]]]));
-    let mut valid_dist = Array2::<f32>::zeros((valid_pos.dim().0, N_RAYS));
-    (0..N_RAYS).for_each(|n| {
+    let mut valid_dist = Array2::<f32>::zeros((valid_pos.dim().0, n_rays));
+    (0..n_rays).for_each(|n| {
         valid_pos.axis_iter(Axis(0)).enumerate().for_each(|(i, v)| {
             valid_dist[[i, n]] = dist_arr[[v[0], v[1], n]];
         });
     });
-    // scale each valid position by 2 and collect the valid indices of positions
-    // inside of the source image dimensions (used for point filtering)
-    valid_pos.mapv_inplace(|v| v * 2);
+    // Scale each valid position from output-grid coordinates to source-image
+    // coordinates, then keep only points inside the original source image.
+    valid_pos.axis_iter_mut(Axis(0)).for_each(|mut pos| {
+        pos[0] *= grid[0];
+        pos[1] *= grid[1];
+    });
     let valid_inds: Vec<usize> = valid_pos
         .axis_iter(Axis(0))
         .enumerate()
         .filter_map(|(i, v)| {
-            if v[0] < src_shape.0 || v[1] < src_shape.1 {
+            if v[0] < src_shape.0 && v[1] < src_shape.1 {
                 Some(i)
             } else {
                 None
@@ -294,24 +328,28 @@ fn prob_dist_to_labels_2d(
         .collect();
     // remove invalid indices (if there are any) from dist, prob and pos
     let poly_ax = Axis(0);
-    if valid_pos.len() > valid_inds.len() {
+    if valid_pos.dim().0 > valid_inds.len() {
         valid_dist = valid_dist.select(poly_ax, &valid_inds);
         valid_prob = valid_prob.select(poly_ax, &valid_inds);
         valid_pos = valid_pos.select(poly_ax, &valid_inds);
     }
     // get the indices that would sort probs in descending order
     let n_polys = valid_prob.len();
+    if n_polys == 0 {
+        return Array2::<u64>::zeros(src_shape);
+    }
     let mut sorted_poly_inds: Vec<usize> = (0..n_polys).collect();
     sorted_poly_inds.sort_by(|&a, &b| valid_prob[b].partial_cmp(&valid_prob[a]).unwrap());
     // sort dist, prob and pos arrays with prob descending order indices
     let poly_dist = valid_dist.select(poly_ax, &sorted_poly_inds);
+    let poly_prob = valid_prob.select(poly_ax, &sorted_poly_inds);
     let poly_pos = valid_pos.select(poly_ax, &sorted_poly_inds);
-    // perform non-maximum supression (NMS) and obtain indices of valid polygons
+    // perform non-maximum suppression (NMS) and obtain indices of valid polygons
     let valid_poly_inds = polygon_nms(
         poly_dist.view(),
         poly_pos.view(),
         n_polys,
-        N_RAYS,
+        n_rays,
         nms_threshold,
     );
     let valid_poly_inds: Vec<usize> = valid_poly_inds
@@ -322,7 +360,7 @@ fn prob_dist_to_labels_2d(
         .collect();
     // filter dist, prob and pos arrays with for valid polygons after NMS
     let poly_dist = poly_dist.select(poly_ax, &valid_poly_inds);
-    let poly_prob = valid_prob.select(poly_ax, &valid_poly_inds);
+    let poly_prob = poly_prob.select(poly_ax, &valid_poly_inds);
     let poly_pos = poly_pos.select(poly_ax, &valid_poly_inds);
     // filter dist, prob and pos arrays by probability threshold
     let valid_prob_inds: Vec<usize> = (0..poly_prob.len())

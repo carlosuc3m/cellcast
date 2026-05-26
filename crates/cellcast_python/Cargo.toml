@@ -13,6 +13,7 @@ crate-type = ["cdylib"]
 doc = false
 
 [dependencies]
+burn = { version = "0.20", features = ["tui", "train", "wgpu", "ndarray"], default-features = false}
 cellcast = { path = "../cellcast" }
 imgal = { git = "https://github.com/imgal-sc/imgal", branch = "main" }
 pyo3 = { version = "0.27", features = ["extension-module", "abi3-py37"] }

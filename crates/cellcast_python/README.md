@@ -81,7 +81,62 @@ data_2d = imread("path/to/data_2d.tif")
 labels = sd.predict_versatile_fluo(data, gpu=True)
 ```
 
-Run `help()` on the `predict_versatile_fluo()` function to see the full function signature and default values. 
+Run `help()` on the `predict_versatile_fluo()` function to see the full function signature and default values.
+
+### Training StarDist2D from Python
+
+The training API reads paired image and ground-truth folders and can report
+progress through Python callbacks:
+
+```python
+import cellcast.training.stardist_2d as train
+
+
+def on_train_begin(plan):
+    print(f"training {plan['epochs']} epochs, {plan['total_steps']} steps")
+
+
+def on_step_end(step):
+    print(step["epoch"], step["step"], step["loss_total"])
+
+
+def on_validation_end(epoch):
+    print(epoch["epoch"], epoch["train_total"], epoch["valid_total"])
+    for preview in epoch["previews"]:
+        image = preview["image"]
+        labels = preview["labels"]
+        prediction = preview["prediction"]
+        prob = preview["prob"]
+        # Display these arrays in your UI/notebook.
+
+
+result = train.train_stardist_2d_folder(
+    "dataset/data",
+    "dataset/gt",
+    output_dir="artifacts/stardist2d",
+    gpu=False,
+    image_channels="grayscale",
+    config={
+        "epochs": 100,
+        "steps_per_epoch": 100,
+        "validation_steps": 10,
+        "batch_size": 4,
+        "patch_size": [256, 256],
+        "grid": [1, 1],
+        "n_rays": 32,
+        "validation_preview_count": 2,
+    },
+    on_train_begin=on_train_begin,
+    on_step_end=on_step_end,
+    on_validation_end=on_validation_end,
+)
+```
+
+`on_train_begin` receives the planned epochs, steps, batch size, patch size, and
+sample counts. `on_step_end` receives the current total, probability, and
+distance losses after every optimizer step. `on_validation_end` receives epoch
+train/validation losses and, when `validation_preview_count > 0`, NumPy arrays
+for validation image, ground truth, predicted labels, and probability map.
 
 ## License
 
