@@ -1,14 +1,15 @@
 use std::path::PathBuf;
 
 use cellcast::training::io_2d::{
-    FolderDatasetOptions2D, ImageChannels2D, LabelColorMode2D,
-    load_training_samples_from_folders_with_options, split_train_valid_2d,
+    load_training_dataset_from_folder_with_options,
+    load_training_samples_from_folders_with_options, split_train_valid_2d, FolderDatasetOptions2D,
+    ImageChannels2D, LabelColorMode2D,
 };
 use cellcast::training::stardist_2d::{
-    AugmentConfig2D, CpuTrainBackend, EpochEndEvent2D, EpochMetrics, LearningRateSchedule2D,
-    Normalization2D, StarDistTrainError, StepMetrics2D, TrainingCallbacks2D, TrainingConfig2D,
-    TrainingPlan2D, TrainingResult2D, TrainingSample2D, ValidationPreview2D, WgpuTrainBackend,
-    save_stardist_2d, train_stardist_2d_with_callbacks,
+    save_stardist_2d, train_stardist_2d_with_callbacks, AugmentConfig2D, CpuTrainBackend,
+    EpochEndEvent2D, EpochMetrics, LearningRateSchedule2D, Normalization2D, StarDistTrainError,
+    StepMetrics2D, TrainingCallbacks2D, TrainingConfig2D, TrainingPlan2D, TrainingResult2D,
+    TrainingSample2D, ValidationPreview2D, WgpuTrainBackend,
 };
 use numpy::IntoPyArray;
 use pyo3::exceptions::PyValueError;
@@ -16,6 +17,8 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
 use crate::error::stardist_train_error_to_pyerr;
+
+const DEFAULT_VALID_FRACTION_2D: f32 = 0.15;
 
 /// Python-facing summary returned after training finishes.
 struct PythonTrainingSummary2D {
@@ -88,8 +91,12 @@ impl TrainingCallbacks2D for PythonTrainingCallbacks2D {
 /// Train a StarDist2D model from paired image and ground-truth folders.
 ///
 /// Args:
-///     data_dir: Folder containing input images.
-///     gt_dir: Folder containing instance-label masks with matching stems.
+///     data_dir: Folder containing input images, or a dataset root when
+///         `gt_dir` is omitted. Dataset roots may contain `train` and
+///         `val`/`validation` folders.
+///     gt_dir: Optional folder containing instance-label masks with matching
+///         stems. If omitted, `data_dir` is auto-detected as a dataset root or
+///         same-folder image/mask layout.
 ///     output_dir: Optional artifact directory. When provided, the trained model
 ///         and config files are saved there.
 ///     config: Optional dict overriding `TrainingConfig2D` defaults.
@@ -105,7 +112,7 @@ impl TrainingCallbacks2D for PythonTrainingCallbacks2D {
 #[pyo3(name = "train_stardist_2d_folder")]
 #[pyo3(signature = (
     data_dir,
-    gt_dir,
+    gt_dir=None,
     output_dir=None,
     config=None,
     valid_fraction=None,
@@ -119,7 +126,7 @@ impl TrainingCallbacks2D for PythonTrainingCallbacks2D {
 pub fn train_stardist_2d_folder<'py>(
     py: Python<'py>,
     data_dir: String,
-    gt_dir: String,
+    gt_dir: Option<String>,
     output_dir: Option<String>,
     config: Option<Bound<'py, PyDict>>,
     valid_fraction: Option<f32>,
@@ -143,13 +150,6 @@ pub fn train_stardist_2d_folder<'py>(
             .or(config_label_color_mode.as_deref()),
     )?;
 
-    let options = FolderDatasetOptions2D {
-        image_channels,
-        label_color_mode,
-    };
-    let samples = load_training_samples_from_folders_with_options(data_dir, gt_dir, options)
-        .map_err(stardist_train_error_to_pyerr)?;
-
     let mut train_config = TrainingConfig2D::default();
     let n_channel_in_was_explicit = config
         .as_ref()
@@ -158,18 +158,33 @@ pub fn train_stardist_2d_folder<'py>(
     if let Some(config_dict) = config.as_ref() {
         apply_training_config_dict(&mut train_config, config_dict)?;
     }
+
+    let options = FolderDatasetOptions2D {
+        image_channels,
+        label_color_mode,
+    };
+    let validation_fraction = validation_fraction_from_inputs(config.as_ref(), valid_fraction)?;
+    let (train_samples, valid_samples) = if let Some(gt_dir) = gt_dir {
+        let samples = load_training_samples_from_folders_with_options(data_dir, gt_dir, options)
+            .map_err(stardist_train_error_to_pyerr)?;
+        split_train_valid_2d(samples, validation_fraction, train_config.seed)
+            .map_err(stardist_train_error_to_pyerr)?
+    } else {
+        let split = load_training_dataset_from_folder_with_options(
+            data_dir,
+            options,
+            validation_fraction,
+            train_config.seed,
+        )
+        .map_err(stardist_train_error_to_pyerr)?;
+        (split.train_samples, split.valid_samples)
+    };
+
     if !n_channel_in_was_explicit {
-        if let Some(first) = samples.first() {
+        if let Some(first) = train_samples.first().or_else(|| valid_samples.first()) {
             train_config.n_channel_in = first.image.dim().0;
         }
     }
-
-    let validation_fraction = valid_fraction
-        .or(config_f32(config.as_ref(), "valid_fraction")?)
-        .unwrap_or(0.15);
-    let (train_samples, valid_samples) =
-        split_train_valid_2d(samples, validation_fraction, train_config.seed)
-            .map_err(stardist_train_error_to_pyerr)?;
 
     let output_dir = output_dir.map(PathBuf::from);
     let use_gpu = gpu.unwrap_or(false);
@@ -398,6 +413,42 @@ fn apply_augment_config(augment: &mut AugmentConfig2D, dict: &Bound<'_, PyDict>)
         augment.gaussian_noise_std = value;
     }
     Ok(())
+}
+
+fn validation_fraction_from_inputs(
+    dict: Option<&Bound<'_, PyDict>>,
+    explicit: Option<f32>,
+) -> PyResult<f32> {
+    let mut value = explicit;
+    for key in [
+        "valid_fraction",
+        "val_fraction",
+        "validation_fraction",
+        "val_percentage",
+        "validation_percentage",
+    ] {
+        if value.is_none() {
+            value = config_f32(dict, key)?;
+        }
+    }
+
+    normalize_validation_fraction(value.unwrap_or(DEFAULT_VALID_FRACTION_2D))
+}
+
+fn normalize_validation_fraction(value: f32) -> PyResult<f32> {
+    let fraction = if value > 1.0 && value <= 100.0 {
+        value / 100.0
+    } else {
+        value
+    };
+
+    if (0.0..1.0).contains(&fraction) {
+        Ok(fraction)
+    } else {
+        Err(PyValueError::new_err(
+            "valid_fraction must be in [0, 1), or val_percentage must be in [0, 100)",
+        ))
+    }
 }
 
 fn parse_image_channels_option(value: Option<&str>) -> PyResult<ImageChannels2D> {

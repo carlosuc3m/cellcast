@@ -7,7 +7,8 @@
 //! - input images become channel-first `Array3<f32>` with shape
 //!   `[channel, y, x]`;
 //! - ground-truth instance masks become `Array2<i64>` with shape `[y, x]`;
-//! - paired folders are matched by file stem, independent of extension.
+//! - paired folders are matched by normalized file stem, independent of
+//!   extension.
 //!
 //! The expected folder layout is:
 //!
@@ -20,6 +21,11 @@
 //!     img_001.tif
 //!     img_002.png
 //! ```
+//!
+//! Split folders can use exact matching (`img_001.tif` with `img_001.png`) or
+//! suffix matching (`img_001_img.tif` with `img_001_mask.png`). A single shared
+//! folder is also supported, but masks must use a known label suffix so they can
+//! be distinguished from images.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -40,6 +46,27 @@ use crate::training::stardist_2d::{StarDistTrainError, TrainingSample2D};
 pub const SUPPORTED_IMAGE_EXTENSIONS_2D: &[&str] = &[
     "tif", "tiff", "png", "jpg", "jpeg", "bmp", "pbm", "pgm", "ppm", "pnm",
 ];
+
+/// Folder names recognized as a training split inside a dataset root.
+pub const TRAIN_SPLIT_DIR_NAMES_2D: &[&str] = &["train", "training"];
+
+/// Folder names recognized as a validation split inside a dataset root.
+pub const VALID_SPLIT_DIR_NAMES_2D: &[&str] = &["val", "valid", "validation"];
+
+/// Folder names recognized as sample-image folders inside a split directory.
+pub const SAMPLE_DIR_NAMES_2D: &[&str] = &[
+    "data", "image", "images", "img", "imgs", "sample", "samples",
+];
+
+/// Folder names recognized as instance-label folders inside a split directory.
+pub const LABEL_DIR_NAMES_2D: &[&str] = &["gt", "label", "labels", "mask", "masks"];
+
+/// Suffixes stripped from sample image stems before pairing.
+pub const SAMPLE_SUFFIXES_2D: &[&str] =
+    &["_img", "_image", "_sample", "_images", "_imgs", "_samples"];
+
+/// Suffixes stripped from instance-label stems before pairing.
+pub const LABEL_SUFFIXES_2D: &[&str] = &["_mask", "_masks", "_label", "_labels", "_gt"];
 
 /// How input image channels should be loaded.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -69,10 +96,18 @@ pub enum LabelColorMode2D {
 }
 
 /// Options used when reading a paired image/mask folder dataset.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct FolderDatasetOptions2D {
     pub image_channels: ImageChannels2D,
     pub label_color_mode: LabelColorMode2D,
+}
+
+/// Train/validation samples loaded from a dataset folder layout.
+#[derive(Clone, Debug)]
+pub struct TrainingDatasetSplit2D {
+    pub train_samples: Vec<TrainingSample2D>,
+    pub valid_samples: Vec<TrainingSample2D>,
+    pub explicit_validation: bool,
 }
 
 /// One image/mask pair found in paired data and ground-truth folders.
@@ -129,10 +164,76 @@ where
     Ok(samples)
 }
 
-/// Pair images and labels by file stem.
+/// Read a dataset root that may contain explicit `train` and `val`/`validation`
+/// folders.
+///
+/// Each split can either contain image and label files in the same folder, or
+/// separate sample/label subfolders such as `data` and `gt`. If no explicit
+/// validation split exists, samples are loaded from the `train` split when it
+/// exists, otherwise from `root_dir`, and split randomly according to
+/// `validation_fraction`.
+pub fn load_training_dataset_from_folder_with_options<P>(
+    root_dir: P,
+    options: FolderDatasetOptions2D,
+    validation_fraction: f32,
+    seed: u64,
+) -> Result<TrainingDatasetSplit2D, StarDistTrainError>
+where
+    P: AsRef<Path>,
+{
+    let root_dir = root_dir.as_ref();
+    ensure_directory(root_dir, "dataset")?;
+
+    if let Some((train_dir, valid_dir)) = find_split_dirs(root_dir)? {
+        let samples = load_training_samples_from_split_dir(&train_dir, options)?;
+        if let Some(valid_dir) = valid_dir {
+            let valid_samples = load_training_samples_from_split_dir(&valid_dir, options)?;
+            Ok(TrainingDatasetSplit2D {
+                train_samples: samples,
+                valid_samples,
+                explicit_validation: true,
+            })
+        } else {
+            let (train_samples, valid_samples) =
+                split_train_valid_2d(samples, validation_fraction, seed)?;
+            Ok(TrainingDatasetSplit2D {
+                train_samples,
+                valid_samples,
+                explicit_validation: false,
+            })
+        }
+    } else {
+        let samples = load_training_samples_from_split_dir(root_dir, options)?;
+        let (train_samples, valid_samples) =
+            split_train_valid_2d(samples, validation_fraction, seed)?;
+        Ok(TrainingDatasetSplit2D {
+            train_samples,
+            valid_samples,
+            explicit_validation: false,
+        })
+    }
+}
+
+fn load_training_samples_from_split_dir(
+    split_dir: &Path,
+    options: FolderDatasetOptions2D,
+) -> Result<Vec<TrainingSample2D>, StarDistTrainError> {
+    match find_sample_label_dirs(split_dir)? {
+        Some((data_dir, gt_dir)) => {
+            load_training_samples_from_folders_with_options(data_dir, gt_dir, options)
+        }
+        None => load_training_samples_from_folders_with_options(split_dir, split_dir, options),
+    }
+}
+
+/// Pair images and labels by normalized file stem.
 ///
 /// Extensions do not need to match. For example, `data/img_001.tif` pairs with
-/// `gt/img_001.png`.
+/// `gt/img_001.png`. Known suffixes are also normalized, so
+/// `data/img_001_img.tif` pairs with `gt/img_001_mask.png`.
+///
+/// If `data_dir` and `gt_dir` point to the same directory, masks must use one
+/// of `LABEL_SUFFIXES_2D` so they can be distinguished from input images.
 pub fn collect_training_file_pairs_2d<D, G>(
     data_dir: D,
     gt_dir: G,
@@ -143,40 +244,15 @@ where
 {
     let data_dir = data_dir.as_ref();
     let gt_dir = gt_dir.as_ref();
-    let images = collect_supported_files(data_dir, "data")?;
-    let mut labels = collect_supported_files(gt_dir, "gt")?;
-    let mut pairs = Vec::with_capacity(images.len());
 
-    for (stem, image_path) in images {
-        let label_path = labels.remove(&stem).ok_or_else(|| {
-            StarDistTrainError::Dataset(format!(
-                "no ground-truth mask found for '{}' from {}",
-                stem,
-                image_path.display()
-            ))
-        })?;
-        pairs.push(TrainingFilePair2D {
-            stem,
-            image_path,
-            label_path,
-        });
+    ensure_directory(data_dir, "data")?;
+    ensure_directory(gt_dir, "gt")?;
+
+    if fs::canonicalize(data_dir)? == fs::canonicalize(gt_dir)? {
+        collect_same_folder_training_file_pairs_2d(data_dir)
+    } else {
+        collect_split_folder_training_file_pairs_2d(data_dir, gt_dir)
     }
-
-    if !labels.is_empty() {
-        let unmatched = labels
-            .keys()
-            .take(5)
-            .cloned()
-            .collect::<Vec<_>>()
-            .join(", ");
-        return Err(StarDistTrainError::Dataset(format!(
-            "found {} ground-truth masks without matching data images; examples: {}",
-            labels.len(),
-            unmatched
-        )));
-    }
-
-    Ok(pairs)
 }
 
 /// Read one 2D image as a channel-first `f32` ndarray.
@@ -277,18 +353,184 @@ pub fn split_train_valid_2d(
     Ok((samples, valid))
 }
 
-fn collect_supported_files(
+fn collect_split_folder_training_file_pairs_2d(
+    data_dir: &Path,
+    gt_dir: &Path,
+) -> Result<Vec<TrainingFilePair2D>, StarDistTrainError> {
+    let images =
+        collect_keyed_supported_files(data_dir, "data", |stem| Some(image_pairing_key(stem)))?;
+    let labels = collect_keyed_supported_files(gt_dir, "gt", |stem| Some(label_pairing_key(stem)))?;
+    pairs_from_keyed_maps(images, labels)
+}
+
+fn collect_same_folder_training_file_pairs_2d(
+    dir: &Path,
+) -> Result<Vec<TrainingFilePair2D>, StarDistTrainError> {
+    let mut images = BTreeMap::new();
+    let mut labels = BTreeMap::new();
+
+    for (stem, path) in collect_supported_file_entries(dir, "shared data/gt")? {
+        if let Some(key) = label_pairing_key_with_required_suffix(&stem) {
+            insert_keyed_file(&mut labels, key, path, "gt")?;
+        } else {
+            insert_keyed_file(&mut images, image_pairing_key(&stem), path, "data")?;
+        }
+    }
+
+    if labels.is_empty() {
+        return Err(StarDistTrainError::Dataset(format!(
+            "no ground-truth masks found in shared directory {}; masks must use one of these suffixes: {}",
+            dir.display(),
+            LABEL_SUFFIXES_2D.join(", ")
+        )));
+    }
+
+    pairs_from_keyed_maps(images, labels)
+}
+
+fn pairs_from_keyed_maps(
+    images: BTreeMap<String, PathBuf>,
+    mut labels: BTreeMap<String, PathBuf>,
+) -> Result<Vec<TrainingFilePair2D>, StarDistTrainError> {
+    if images.is_empty() {
+        return Err(StarDistTrainError::Dataset(
+            "no data image files found after applying pairing rules".to_string(),
+        ));
+    }
+
+    let mut pairs = Vec::with_capacity(images.len());
+    for (stem, image_path) in images {
+        let label_path = labels.remove(&stem).ok_or_else(|| {
+            StarDistTrainError::Dataset(format!(
+                "no ground-truth mask found for sample key '{}' from {}; accepted label suffixes: {}",
+                stem,
+                image_path.display(),
+                LABEL_SUFFIXES_2D.join(", ")
+            ))
+        })?;
+        pairs.push(TrainingFilePair2D {
+            stem,
+            image_path,
+            label_path,
+        });
+    }
+
+    if !labels.is_empty() {
+        let unmatched = labels
+            .keys()
+            .take(5)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(StarDistTrainError::Dataset(format!(
+            "found {} ground-truth masks without matching data images; examples: {}",
+            labels.len(),
+            unmatched
+        )));
+    }
+
+    Ok(pairs)
+}
+
+fn collect_keyed_supported_files<F>(
     dir: &Path,
     role: &str,
-) -> Result<BTreeMap<String, PathBuf>, StarDistTrainError> {
-    if !dir.is_dir() {
+    mut key_fn: F,
+) -> Result<BTreeMap<String, PathBuf>, StarDistTrainError>
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    let mut files = BTreeMap::new();
+    for (stem, path) in collect_supported_file_entries(dir, role)? {
+        if let Some(key) = key_fn(&stem) {
+            insert_keyed_file(&mut files, key, path, role)?;
+        }
+    }
+
+    if files.is_empty() {
         return Err(StarDistTrainError::Dataset(format!(
-            "{role} directory does not exist or is not a directory: {}",
+            "no supported {role} files found in directory {} after applying pairing rules",
             dir.display()
         )));
     }
 
-    let mut files = BTreeMap::new();
+    Ok(files)
+}
+
+fn find_split_dirs(
+    root_dir: &Path,
+) -> Result<Option<(PathBuf, Option<PathBuf>)>, StarDistTrainError> {
+    let train_dir = find_one_child_dir(root_dir, TRAIN_SPLIT_DIR_NAMES_2D, "training split")?;
+    let valid_dir = find_one_child_dir(root_dir, VALID_SPLIT_DIR_NAMES_2D, "validation split")?;
+
+    match (train_dir, valid_dir) {
+        (Some(train_dir), Some(valid_dir)) => Ok(Some((train_dir, Some(valid_dir)))),
+        (Some(train_dir), None) => Ok(Some((train_dir, None))),
+        (None, Some(valid_dir)) => Ok(Some((root_dir.to_path_buf(), Some(valid_dir)))),
+        (None, None) => Ok(None),
+    }
+}
+
+fn find_sample_label_dirs(
+    split_dir: &Path,
+) -> Result<Option<(PathBuf, PathBuf)>, StarDistTrainError> {
+    let sample_dir = find_one_child_dir(split_dir, SAMPLE_DIR_NAMES_2D, "sample image folder")?;
+    let label_dir = find_one_child_dir(split_dir, LABEL_DIR_NAMES_2D, "label folder")?;
+
+    match (sample_dir, label_dir) {
+        (Some(sample_dir), Some(label_dir)) => Ok(Some((sample_dir, label_dir))),
+        (None, None) => Ok(None),
+        (Some(sample_dir), None) => Err(StarDistTrainError::Dataset(format!(
+            "found sample folder {} but no label folder; expected one of: {}",
+            sample_dir.display(),
+            LABEL_DIR_NAMES_2D.join(", ")
+        ))),
+        (None, Some(label_dir)) => Err(StarDistTrainError::Dataset(format!(
+            "found label folder {} but no sample folder; expected one of: {}",
+            label_dir.display(),
+            SAMPLE_DIR_NAMES_2D.join(", ")
+        ))),
+    }
+}
+
+fn find_one_child_dir(
+    parent: &Path,
+    names: &[&str],
+    role: &str,
+) -> Result<Option<PathBuf>, StarDistTrainError> {
+    let found = names
+        .iter()
+        .filter_map(|name| {
+            let path = parent.join(name);
+            path.is_dir().then_some(path)
+        })
+        .collect::<Vec<_>>();
+
+    match found.as_slice() {
+        [] => Ok(None),
+        [path] => Ok(Some(path.clone())),
+        _ => {
+            let paths = found
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            Err(StarDistTrainError::Dataset(format!(
+                "ambiguous {role} under {}: {}",
+                parent.display(),
+                paths
+            )))
+        }
+    }
+}
+
+fn collect_supported_file_entries(
+    dir: &Path,
+    role: &str,
+) -> Result<Vec<(String, PathBuf)>, StarDistTrainError> {
+    ensure_directory(dir, role)?;
+
+    let mut files = Vec::new();
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         if !entry.file_type()?.is_file() {
@@ -301,14 +543,7 @@ fn collect_supported_files(
         }
 
         let stem = file_stem_key(&path)?;
-        if let Some(previous) = files.insert(stem.clone(), path.clone()) {
-            return Err(StarDistTrainError::Dataset(format!(
-                "duplicate {role} file stem '{}': {} and {}",
-                stem,
-                previous.display(),
-                path.display()
-            )));
-        }
+        files.push((stem, path));
     }
 
     if files.is_empty() {
@@ -319,7 +554,60 @@ fn collect_supported_files(
         )));
     }
 
+    files.sort_by(|(stem_a, path_a), (stem_b, path_b)| stem_a.cmp(stem_b).then(path_a.cmp(path_b)));
     Ok(files)
+}
+
+fn ensure_directory(dir: &Path, role: &str) -> Result<(), StarDistTrainError> {
+    if !dir.is_dir() {
+        return Err(StarDistTrainError::Dataset(format!(
+            "{role} directory does not exist or is not a directory: {}",
+            dir.display()
+        )));
+    }
+    Ok(())
+}
+
+fn insert_keyed_file(
+    files: &mut BTreeMap<String, PathBuf>,
+    key: String,
+    path: PathBuf,
+    role: &str,
+) -> Result<(), StarDistTrainError> {
+    if let Some(previous) = files.insert(key.clone(), path.clone()) {
+        return Err(StarDistTrainError::Dataset(format!(
+            "duplicate {role} sample key '{}' after suffix normalization: {} and {}",
+            key,
+            previous.display(),
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn image_pairing_key(stem: &str) -> String {
+    strip_known_suffix(stem, SAMPLE_SUFFIXES_2D)
+        .unwrap_or(stem)
+        .to_string()
+}
+
+fn label_pairing_key(stem: &str) -> String {
+    label_pairing_key_with_required_suffix(stem).unwrap_or_else(|| stem.to_string())
+}
+
+fn label_pairing_key_with_required_suffix(stem: &str) -> Option<String> {
+    strip_known_suffix(stem, LABEL_SUFFIXES_2D).map(ToString::to_string)
+}
+
+fn strip_known_suffix<'a>(stem: &'a str, suffixes: &[&str]) -> Option<&'a str> {
+    suffixes.iter().find_map(|suffix| {
+        let base = stem.strip_suffix(suffix)?;
+        if base.is_empty() {
+            None
+        } else {
+            Some(base)
+        }
+    })
 }
 
 fn has_supported_extension(path: &Path) -> bool {
@@ -693,4 +981,129 @@ fn f32_label_to_i64(value: f32, path: &Path) -> Result<i64, StarDistTrainError> 
     }
 
     Ok(rounded as i64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use image::{GrayImage, Luma};
+    use std::error::Error;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct TempDataset {
+        path: PathBuf,
+    }
+
+    impl TempDataset {
+        fn new(name: &str) -> Result<Self, Box<dyn Error>> {
+            let millis = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
+            let path = std::env::temp_dir().join(format!(
+                "cellcast_io_2d_{name}_{}_{}",
+                std::process::id(),
+                millis
+            ));
+            fs::create_dir_all(&path)?;
+            Ok(Self { path })
+        }
+    }
+
+    impl Drop for TempDataset {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn touch(path: &Path) -> Result<(), Box<dyn Error>> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(path, b"")?;
+        Ok(())
+    }
+
+    fn write_gray_png(path: &Path, value: u8) -> Result<(), Box<dyn Error>> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        GrayImage::from_pixel(8, 8, Luma([value])).save(path)?;
+        Ok(())
+    }
+
+    fn file_name(path: &Path) -> String {
+        path.file_name().unwrap().to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn split_folder_pairs_suffix_stems() -> Result<(), Box<dyn Error>> {
+        let dataset = TempDataset::new("split_suffix")?;
+        let data_dir = dataset.path.join("data");
+        let gt_dir = dataset.path.join("gt");
+        touch(&data_dir.join("cell_001_img.tif"))?;
+        touch(&gt_dir.join("cell_001_mask.png"))?;
+
+        let pairs = collect_training_file_pairs_2d(&data_dir, &gt_dir)?;
+
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].stem, "cell_001");
+        assert_eq!(file_name(&pairs[0].image_path), "cell_001_img.tif");
+        assert_eq!(file_name(&pairs[0].label_path), "cell_001_mask.png");
+        Ok(())
+    }
+
+    #[test]
+    fn same_folder_pairs_plain_image_with_label_suffix() -> Result<(), Box<dyn Error>> {
+        let dataset = TempDataset::new("same_folder_plain")?;
+        touch(&dataset.path.join("cell_001.tif"))?;
+        touch(&dataset.path.join("cell_001_gt.png"))?;
+
+        let pairs = collect_training_file_pairs_2d(&dataset.path, &dataset.path)?;
+
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].stem, "cell_001");
+        assert_eq!(file_name(&pairs[0].image_path), "cell_001.tif");
+        assert_eq!(file_name(&pairs[0].label_path), "cell_001_gt.png");
+        Ok(())
+    }
+
+    #[test]
+    fn dataset_root_uses_explicit_validation_split() -> Result<(), Box<dyn Error>> {
+        let dataset = TempDataset::new("explicit_validation")?;
+        write_gray_png(&dataset.path.join("train/data/train_a_img.png"), 5)?;
+        write_gray_png(&dataset.path.join("train/gt/train_a_mask.png"), 1)?;
+        write_gray_png(&dataset.path.join("validation/val_a.png"), 6)?;
+        write_gray_png(&dataset.path.join("validation/val_a_label.png"), 1)?;
+
+        let split = load_training_dataset_from_folder_with_options(
+            &dataset.path,
+            FolderDatasetOptions2D::default(),
+            0.5,
+            11,
+        )?;
+
+        assert!(split.explicit_validation);
+        assert_eq!(split.train_samples.len(), 1);
+        assert_eq!(split.valid_samples.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn dataset_root_with_train_only_uses_random_validation_split() -> Result<(), Box<dyn Error>> {
+        let dataset = TempDataset::new("train_only_split")?;
+        write_gray_png(&dataset.path.join("train/data/train_a.png"), 5)?;
+        write_gray_png(&dataset.path.join("train/gt/train_a.png"), 1)?;
+        write_gray_png(&dataset.path.join("train/data/train_b.png"), 6)?;
+        write_gray_png(&dataset.path.join("train/gt/train_b.png"), 1)?;
+
+        let split = load_training_dataset_from_folder_with_options(
+            &dataset.path,
+            FolderDatasetOptions2D::default(),
+            0.5,
+            11,
+        )?;
+
+        assert!(!split.explicit_validation);
+        assert_eq!(split.train_samples.len(), 1);
+        assert_eq!(split.valid_samples.len(), 1);
+        Ok(())
+    }
 }

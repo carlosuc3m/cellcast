@@ -141,6 +141,48 @@ pixel and is lighter. The model, batch builder, and loss all stay
 channel-first; conversion to StarDist's `[y, x, rays]` array layout only
 happens at the NMS/label-rendering boundary.
 
+The Python training API can also auto-detect more flexible dataset layouts. If
+`gt_dir` is omitted, pass a dataset root instead:
+
+```text
+dataset/
+  train/
+    cell_001_img.tif
+    cell_001_mask.tif
+    cell_002.tif
+    cell_002_gt.tif
+  validation/
+    cell_003_image.png
+    cell_003_label.png
+```
+
+or with separate folders inside each split:
+
+```text
+dataset/
+  train/
+    images/
+      cell_001_img.tif
+    labels/
+      cell_001_mask.tif
+  val/
+    data/
+      cell_002.tif
+    gt/
+      cell_002.tif
+```
+
+Recognized image suffixes are `_img`, `_image`, `_sample`, `_images`, `_imgs`,
+and `_samples`. Recognized label suffixes are `_mask`, `_masks`, `_label`,
+`_labels`, and `_gt`. Split folders can also use exact matching with no suffix,
+for example `data/cell_001.tif` with `gt/cell_001.png`. Same-folder layouts
+require a label suffix so masks can be distinguished from images.
+
+If a `val`, `valid`, or `validation` folder exists, those samples are used as a
+fixed validation set. If there is no validation folder, `valid_fraction`
+defaults to `0.15` and selects a random validation subset once using the
+training seed.
+
 ### Using cellcast with Python
 
 You can use cellcast in your Python project by using the `cellcast_python` crate. Pre-compiled releases are available on PyPI as the `cellcast` package
