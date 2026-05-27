@@ -151,6 +151,26 @@ distance losses after every optimizer step. `on_validation_end` receives epoch
 train/validation losses and, when `validation_preview_count > 0`, NumPy arrays
 for validation image, ground truth, predicted labels, and probability map.
 
+Saved training artifacts can be used for inference from the same module:
+
+```python
+import tifffile
+import cellcast.training.stardist_2d as train
+
+image = tifffile.imread("dataset/data/example.tif")
+labels = train.predict_stardist_2d(
+    "artifacts/stardist2d",
+    image,
+    gpu=False,
+)
+tifffile.imwrite("prediction.tif", labels.astype("uint32"))
+```
+
+For multi-channel inputs, pass `axis` to identify the channel dimension. The
+saved training config controls preprocessing, including percentile
+normalization and thresholds, unless `prob_threshold` or `nms_threshold` are
+provided explicitly.
+
 ## License
 
 Cellcast *itself* is a dual-licensed project with your choice of:

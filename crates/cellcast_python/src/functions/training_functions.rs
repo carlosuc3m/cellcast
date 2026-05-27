@@ -1,17 +1,21 @@
 use std::path::PathBuf;
 
+use burn::tensor::backend::Backend;
 use cellcast::training::io_2d::{
     load_training_dataset_from_folder_with_options,
     load_training_samples_from_folders_with_options, split_train_valid_2d, FolderDatasetOptions2D,
     ImageChannels2D, LabelColorMode2D,
 };
 use cellcast::training::stardist_2d::{
-    save_stardist_2d, train_stardist_2d_with_callbacks, AugmentConfig2D, CpuTrainBackend,
+    load_stardist_2d, predict_stardist_2d_with_thresholds, save_stardist_2d,
+    train_stardist_2d_with_callbacks, AugmentConfig2D, CpuInferBackend, CpuTrainBackend,
     EpochEndEvent2D, EpochMetrics, LearningRateSchedule2D, Normalization2D, StarDistTrainError,
     StepMetrics2D, TrainingCallbacks2D, TrainingConfig2D, TrainingPlan2D, TrainingResult2D,
-    TrainingSample2D, ValidationPreview2D, WgpuTrainBackend,
+    TrainingSample2D, ValidationPreview2D, WgpuInferBackend, WgpuTrainBackend,
 };
-use numpy::IntoPyArray;
+use numpy::ndarray::{Array2, Array3, ArrayView2, ArrayView3};
+use numpy::{IntoPyArray, PyArray2, PyReadonlyArray2, PyReadonlyArray3};
+use pyo3::exceptions::PyTypeError;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
@@ -216,6 +220,93 @@ pub fn train_stardist_2d_folder<'py>(
     training_summary_to_pydict(py, &summary)
 }
 
+/// Predict instance labels with a StarDist2D model saved by
+/// `train_stardist_2d_folder`.
+///
+/// Args:
+///     model_dir: Artifact directory produced by training.
+///     data: Input image. A 2D array is treated as one grayscale channel. A 3D
+///         array is interpreted according to `axis`.
+///     prob_threshold: Optional object probability threshold. If omitted, the
+///         saved training config threshold is used.
+///     nms_threshold: Optional NMS overlap threshold. If omitted, the saved
+///         training config threshold is used.
+///     axis: Channel axis for 3D input arrays. Defaults to the last axis.
+///     gpu: If true, use the Burn WebGPU backend. Otherwise use CPU.
+#[pyfunction]
+#[pyo3(name = "predict_stardist_2d")]
+#[pyo3(signature = (
+    model_dir,
+    data,
+    prob_threshold=None,
+    nms_threshold=None,
+    axis=None,
+    gpu=None
+))]
+pub fn predict_stardist_2d_saved<'py>(
+    py: Python<'py>,
+    model_dir: String,
+    data: Bound<'py, PyAny>,
+    prob_threshold: Option<f32>,
+    nms_threshold: Option<f32>,
+    axis: Option<usize>,
+    gpu: Option<bool>,
+) -> PyResult<Bound<'py, PyArray2<u64>>> {
+    let image = py_image_to_channel_first(&data, axis)?;
+    let use_gpu = gpu.unwrap_or(false);
+    let labels = py
+        .detach(|| {
+            if use_gpu {
+                predict_saved_backend::<WgpuInferBackend>(
+                    &model_dir,
+                    &image,
+                    prob_threshold,
+                    nms_threshold,
+                )
+            } else {
+                predict_saved_backend::<CpuInferBackend>(
+                    &model_dir,
+                    &image,
+                    prob_threshold,
+                    nms_threshold,
+                )
+            }
+        })
+        .map_err(stardist_train_error_to_pyerr)?;
+    Ok(labels.into_pyarray(py))
+}
+
+/// Alias for clarity when calling from Python.
+#[pyfunction]
+#[pyo3(name = "predict_trained_stardist_2d")]
+#[pyo3(signature = (
+    model_dir,
+    data,
+    prob_threshold=None,
+    nms_threshold=None,
+    axis=None,
+    gpu=None
+))]
+pub fn predict_trained_stardist_2d<'py>(
+    py: Python<'py>,
+    model_dir: String,
+    data: Bound<'py, PyAny>,
+    prob_threshold: Option<f32>,
+    nms_threshold: Option<f32>,
+    axis: Option<usize>,
+    gpu: Option<bool>,
+) -> PyResult<Bound<'py, PyArray2<u64>>> {
+    predict_stardist_2d_saved(
+        py,
+        model_dir,
+        data,
+        prob_threshold,
+        nms_threshold,
+        axis,
+        gpu,
+    )
+}
+
 fn run_training_backend<B>(
     train_samples: Vec<TrainingSample2D>,
     valid_samples: Vec<TrainingSample2D>,
@@ -254,6 +345,153 @@ where
         train_samples: train_count,
         valid_samples: valid_count,
     })
+}
+
+fn predict_saved_backend<B>(
+    model_dir: &str,
+    image: &Array3<f32>,
+    prob_threshold: Option<f32>,
+    nms_threshold: Option<f32>,
+) -> Result<Array2<u64>, StarDistTrainError>
+where
+    B: Backend<FloatElem = f32, IntElem = i32>,
+    B::Device: Default,
+{
+    let device = Default::default();
+    let (model, config) = load_stardist_2d::<B, _>(model_dir, &device)?;
+    let prob_threshold = prob_threshold.unwrap_or(config.prob_threshold);
+    let nms_threshold = nms_threshold.unwrap_or(config.nms_threshold);
+    predict_stardist_2d_with_thresholds(
+        &model,
+        image,
+        &config,
+        prob_threshold,
+        nms_threshold,
+        &device,
+    )
+}
+
+fn py_image_to_channel_first(
+    data: &Bound<'_, PyAny>,
+    axis: Option<usize>,
+) -> PyResult<Array3<f32>> {
+    if let Ok(arr) = data.extract::<PyReadonlyArray2<u8>>() {
+        Ok(array2_to_channel_first(arr.as_array()))
+    } else if let Ok(arr) = data.extract::<PyReadonlyArray2<u16>>() {
+        Ok(array2_to_channel_first(arr.as_array()))
+    } else if let Ok(arr) = data.extract::<PyReadonlyArray2<u64>>() {
+        Ok(array2_to_channel_first(arr.as_array()))
+    } else if let Ok(arr) = data.extract::<PyReadonlyArray2<f32>>() {
+        Ok(array2_to_channel_first(arr.as_array()))
+    } else if let Ok(arr) = data.extract::<PyReadonlyArray2<f64>>() {
+        Ok(array2_to_channel_first(arr.as_array()))
+    } else if let Ok(arr) = data.extract::<PyReadonlyArray3<u8>>() {
+        array3_to_channel_first(arr.as_array(), axis)
+    } else if let Ok(arr) = data.extract::<PyReadonlyArray3<u16>>() {
+        array3_to_channel_first(arr.as_array(), axis)
+    } else if let Ok(arr) = data.extract::<PyReadonlyArray3<u64>>() {
+        array3_to_channel_first(arr.as_array(), axis)
+    } else if let Ok(arr) = data.extract::<PyReadonlyArray3<f32>>() {
+        array3_to_channel_first(arr.as_array(), axis)
+    } else if let Ok(arr) = data.extract::<PyReadonlyArray3<f64>>() {
+        array3_to_channel_first(arr.as_array(), axis)
+    } else {
+        Err(PyTypeError::new_err(
+            "data must be a 2D or 3D NumPy array with dtype u8, u16, u64, f32, or f64",
+        ))
+    }
+}
+
+trait ImageScalar2D {
+    fn to_f32(self) -> f32;
+}
+
+impl ImageScalar2D for u8 {
+    fn to_f32(self) -> f32 {
+        self as f32
+    }
+}
+
+impl ImageScalar2D for u16 {
+    fn to_f32(self) -> f32 {
+        self as f32
+    }
+}
+
+impl ImageScalar2D for u64 {
+    fn to_f32(self) -> f32 {
+        self as f32
+    }
+}
+
+impl ImageScalar2D for f32 {
+    fn to_f32(self) -> f32 {
+        self
+    }
+}
+
+impl ImageScalar2D for f64 {
+    fn to_f32(self) -> f32 {
+        self as f32
+    }
+}
+
+fn array2_to_channel_first<T>(view: ArrayView2<'_, T>) -> Array3<f32>
+where
+    T: Copy + ImageScalar2D,
+{
+    let (height, width) = view.dim();
+    let mut image = Array3::<f32>::zeros((1, height, width));
+    for y in 0..height {
+        for x in 0..width {
+            image[[0, y, x]] = view[[y, x]].to_f32();
+        }
+    }
+    image
+}
+
+fn array3_to_channel_first<T>(view: ArrayView3<'_, T>, axis: Option<usize>) -> PyResult<Array3<f32>>
+where
+    T: Copy + ImageScalar2D,
+{
+    let axis = axis.unwrap_or(2);
+    let (d0, d1, d2) = view.dim();
+    match axis {
+        0 => {
+            let mut image = Array3::<f32>::zeros((d0, d1, d2));
+            for c in 0..d0 {
+                for y in 0..d1 {
+                    for x in 0..d2 {
+                        image[[c, y, x]] = view[[c, y, x]].to_f32();
+                    }
+                }
+            }
+            Ok(image)
+        }
+        1 => {
+            let mut image = Array3::<f32>::zeros((d1, d0, d2));
+            for y in 0..d0 {
+                for c in 0..d1 {
+                    for x in 0..d2 {
+                        image[[c, y, x]] = view[[y, c, x]].to_f32();
+                    }
+                }
+            }
+            Ok(image)
+        }
+        2 => {
+            let mut image = Array3::<f32>::zeros((d2, d0, d1));
+            for y in 0..d0 {
+                for x in 0..d1 {
+                    for c in 0..d2 {
+                        image[[c, y, x]] = view[[y, x, c]].to_f32();
+                    }
+                }
+            }
+            Ok(image)
+        }
+        _ => Err(PyValueError::new_err("axis must be 0, 1, or 2")),
+    }
 }
 
 fn apply_training_config_dict(
