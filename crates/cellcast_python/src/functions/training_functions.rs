@@ -17,8 +17,8 @@ use cellcast::training::stardist_2d::{
     StarDistTrainError, StepMetrics2D, TrainingCallbacks2D, TrainingConfig2D, TrainingPlan2D,
     TrainingResult2D, TrainingSample2D, ValidationPreview2D, WgpuInferBackend, WgpuTrainBackend,
 };
-use numpy::ndarray::{Array2, Array3, ArrayView2, ArrayView3};
-use numpy::{IntoPyArray, PyArray2, PyReadonlyArray2, PyReadonlyArray3};
+use numpy::ndarray::{s, Array2, Array3, Array4, ArrayView2, ArrayView3, ArrayView4};
+use numpy::{IntoPyArray, PyReadonlyArray2, PyReadonlyArray3, PyReadonlyArray4};
 use pyo3::exceptions::PyTypeError;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -55,6 +55,16 @@ enum TrainedStarDist2DSource {
     ModelFile(PathBuf),
 }
 
+enum PyImageInput2D {
+    Single(Array3<f32>),
+    BatchBcyx(Array4<f32>),
+}
+
+enum PyPredictionOutput2D {
+    Single(Array2<u64>),
+    Batch(Array3<u64>),
+}
+
 enum LoadedStarDist2DModel {
     Cpu {
         model: TrainableStarDist2D<CpuInferBackend>,
@@ -87,13 +97,13 @@ impl PyStarDist2DModel {
         prob_threshold: Option<f32>,
         nms_threshold: Option<f32>,
         axis: Option<usize>,
-    ) -> PyResult<Bound<'py, PyArray2<u64>>> {
-        let image = py_image_to_channel_first(&data, axis)?;
-        let labels = self
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let input = py_image_input_2d(&data, axis)?;
+        let output = self
             .inner
-            .predict(&image, prob_threshold, nms_threshold)
+            .predict_input(&input, prob_threshold, nms_threshold)
             .map_err(stardist_train_error_to_pyerr)?;
-        Ok(labels.into_pyarray(py))
+        Ok(prediction_output_to_py(py, output))
     }
 
     #[getter]
@@ -175,12 +185,12 @@ impl LoadedStarDist2DModel {
         }
     }
 
-    fn predict(
+    fn predict_input(
         &self,
-        image: &Array3<f32>,
+        input: &PyImageInput2D,
         prob_threshold: Option<f32>,
         nms_threshold: Option<f32>,
-    ) -> Result<Array2<u64>, StarDistTrainError> {
+    ) -> Result<PyPredictionOutput2D, StarDistTrainError> {
         match self {
             Self::Cpu {
                 model,
@@ -189,13 +199,13 @@ impl LoadedStarDist2DModel {
             } => {
                 let prob_threshold = prob_threshold.unwrap_or(config.prob_threshold);
                 let nms_threshold = nms_threshold.unwrap_or(config.nms_threshold);
-                predict_stardist_2d_with_thresholds(
+                predict_with_model_input(
                     model,
-                    image,
                     config,
+                    device,
+                    input,
                     prob_threshold,
                     nms_threshold,
-                    device,
                 )
             }
             Self::Wgpu {
@@ -205,13 +215,13 @@ impl LoadedStarDist2DModel {
             } => {
                 let prob_threshold = prob_threshold.unwrap_or(config.prob_threshold);
                 let nms_threshold = nms_threshold.unwrap_or(config.nms_threshold);
-                predict_stardist_2d_with_thresholds(
+                predict_with_model_input(
                     model,
-                    image,
                     config,
+                    device,
+                    input,
                     prob_threshold,
                     nms_threshold,
-                    device,
                 )
             }
         }
@@ -445,29 +455,29 @@ pub fn predict_stardist_2d_saved<'py>(
     nms_threshold: Option<f32>,
     axis: Option<usize>,
     gpu: Option<bool>,
-) -> PyResult<Bound<'py, PyArray2<u64>>> {
-    let image = py_image_to_channel_first(&data, axis)?;
+) -> PyResult<Bound<'py, PyAny>> {
+    let input = py_image_input_2d(&data, axis)?;
     let use_gpu = gpu.unwrap_or(false);
-    let labels = py
+    let output = py
         .detach(|| {
             if use_gpu {
                 predict_saved_backend::<WgpuInferBackend>(
                     &model_dir,
-                    &image,
+                    &input,
                     prob_threshold,
                     nms_threshold,
                 )
             } else {
                 predict_saved_backend::<CpuInferBackend>(
                     &model_dir,
-                    &image,
+                    &input,
                     prob_threshold,
                     nms_threshold,
                 )
             }
         })
         .map_err(stardist_train_error_to_pyerr)?;
-    Ok(labels.into_pyarray(py))
+    Ok(prediction_output_to_py(py, output))
 }
 
 /// Load or create a StarDist2D model once for repeated inference.
@@ -555,7 +565,7 @@ pub fn predict_trained_stardist_2d<'py>(
     nms_threshold: Option<f32>,
     axis: Option<usize>,
     gpu: Option<bool>,
-) -> PyResult<Bound<'py, PyArray2<u64>>> {
+) -> PyResult<Bound<'py, PyAny>> {
     predict_stardist_2d_saved(
         py,
         model_dir,
@@ -816,10 +826,10 @@ where
 
 fn predict_saved_backend<B>(
     model_source: &str,
-    image: &Array3<f32>,
+    input: &PyImageInput2D,
     prob_threshold: Option<f32>,
     nms_threshold: Option<f32>,
-) -> Result<Array2<u64>, StarDistTrainError>
+) -> Result<PyPredictionOutput2D, StarDistTrainError>
 where
     B: Backend<FloatElem = f32, IntElem = i32>,
     B::Device: Default,
@@ -829,14 +839,95 @@ where
     let (model, config) = load_trained_stardist_2d_backend_result::<B>(&source, &device)?;
     let prob_threshold = prob_threshold.unwrap_or(config.prob_threshold);
     let nms_threshold = nms_threshold.unwrap_or(config.nms_threshold);
-    predict_stardist_2d_with_thresholds(
+    predict_with_model_input(
         &model,
-        image,
         &config,
+        &device,
+        input,
         prob_threshold,
         nms_threshold,
-        &device,
     )
+}
+
+fn predict_with_model_input<B>(
+    model: &TrainableStarDist2D<B>,
+    config: &TrainingConfig2D,
+    device: &B::Device,
+    input: &PyImageInput2D,
+    prob_threshold: f32,
+    nms_threshold: f32,
+) -> Result<PyPredictionOutput2D, StarDistTrainError>
+where
+    B: Backend<FloatElem = f32, IntElem = i32>,
+{
+    match input {
+        PyImageInput2D::Single(image) => {
+            let labels = predict_stardist_2d_with_thresholds(
+                model,
+                image,
+                config,
+                prob_threshold,
+                nms_threshold,
+                device,
+            )?;
+            Ok(PyPredictionOutput2D::Single(labels))
+        }
+        PyImageInput2D::BatchBcyx(batch) => {
+            let (batch_size, channels, height, width) = batch.dim();
+            if batch_size == 0 {
+                return Err(StarDistTrainError::Shape(
+                    "batch dimension must be positive".to_string(),
+                ));
+            }
+            let mut labels = Array3::<u64>::zeros((batch_size, height, width));
+            for batch_index in 0..batch_size {
+                let image = batch.slice(s![batch_index, .., .., ..]).to_owned();
+                if image.dim() != (channels, height, width) {
+                    return Err(StarDistTrainError::Shape(
+                        "all batch entries must have the same [C, Y, X] shape".to_string(),
+                    ));
+                }
+                let prediction = predict_stardist_2d_with_thresholds(
+                    model,
+                    &image,
+                    config,
+                    prob_threshold,
+                    nms_threshold,
+                    device,
+                )?;
+                labels
+                    .slice_mut(s![batch_index, .., ..])
+                    .assign(&prediction);
+            }
+            Ok(PyPredictionOutput2D::Batch(labels))
+        }
+    }
+}
+
+fn prediction_output_to_py<'py>(
+    py: Python<'py>,
+    output: PyPredictionOutput2D,
+) -> Bound<'py, PyAny> {
+    match output {
+        PyPredictionOutput2D::Single(labels) => labels.into_pyarray(py).into_any(),
+        PyPredictionOutput2D::Batch(labels) => labels.into_pyarray(py).into_any(),
+    }
+}
+
+fn py_image_input_2d(data: &Bound<'_, PyAny>, axis: Option<usize>) -> PyResult<PyImageInput2D> {
+    if let Ok(arr) = data.extract::<PyReadonlyArray4<u8>>() {
+        array4_bcyx_to_batch(arr.as_array(), axis).map(PyImageInput2D::BatchBcyx)
+    } else if let Ok(arr) = data.extract::<PyReadonlyArray4<u16>>() {
+        array4_bcyx_to_batch(arr.as_array(), axis).map(PyImageInput2D::BatchBcyx)
+    } else if let Ok(arr) = data.extract::<PyReadonlyArray4<u64>>() {
+        array4_bcyx_to_batch(arr.as_array(), axis).map(PyImageInput2D::BatchBcyx)
+    } else if let Ok(arr) = data.extract::<PyReadonlyArray4<f32>>() {
+        array4_bcyx_to_batch(arr.as_array(), axis).map(PyImageInput2D::BatchBcyx)
+    } else if let Ok(arr) = data.extract::<PyReadonlyArray4<f64>>() {
+        array4_bcyx_to_batch(arr.as_array(), axis).map(PyImageInput2D::BatchBcyx)
+    } else {
+        py_image_to_channel_first(data, axis).map(PyImageInput2D::Single)
+    }
 }
 
 fn py_image_to_channel_first(
@@ -865,7 +956,7 @@ fn py_image_to_channel_first(
         array3_to_channel_first(arr.as_array(), axis)
     } else {
         Err(PyTypeError::new_err(
-            "data must be a 2D or 3D NumPy array with dtype u8, u16, u64, f32, or f64",
+            "data must be a 2D [Y, X], 3D single-image, or 4D [B, C, Y, X] NumPy array with dtype u8, u16, u64, f32, or f64",
         ))
     }
 }
@@ -960,6 +1051,31 @@ where
         }
         _ => Err(PyValueError::new_err("axis must be 0, 1, or 2")),
     }
+}
+
+fn array4_bcyx_to_batch<T>(view: ArrayView4<'_, T>, axis: Option<usize>) -> PyResult<Array4<f32>>
+where
+    T: Copy + ImageScalar2D,
+{
+    if let Some(axis) = axis {
+        if axis != 1 {
+            return Err(PyValueError::new_err(
+                "4D batch input must be [B, C, Y, X]; axis must be omitted or set to 1",
+            ));
+        }
+    }
+    let (batch, channels, height, width) = view.dim();
+    let mut images = Array4::<f32>::zeros((batch, channels, height, width));
+    for b in 0..batch {
+        for c in 0..channels {
+            for y in 0..height {
+                for x in 0..width {
+                    images[[b, c, y, x]] = view[[b, c, y, x]].to_f32();
+                }
+            }
+        }
+    }
+    Ok(images)
 }
 
 fn training_config_from_pydict(

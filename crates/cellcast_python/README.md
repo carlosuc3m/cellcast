@@ -228,8 +228,21 @@ rgb_model = train.load_stardist_2d(
 )
 ```
 
-For multi-channel inputs, pass `axis` to identify the channel dimension. The
-saved training config controls preprocessing, including percentile
+For multi-channel single-image inputs, pass `axis` to identify the channel
+dimension. The same `predict` method also accepts batches in
+Burn/channel-first order:
+
+```python
+# batch shape: [B, C, Y, X]
+labels = model.predict(batch_bcyx)
+# labels shape: [B, Y, X]
+```
+
+For 4D input, the only accepted layout is `[B, C, Y, X]`; omit `axis` or pass
+`axis=1`. Batch prediction currently runs StarDist postprocessing per image, so
+it is mainly an API convenience and does not yet batch NMS.
+
+The saved training config controls preprocessing, including percentile
 normalization and thresholds. You can change persistent thresholds through
 `model.prob_threshold`, `model.nms_threshold`, or `model.set_thresholds(...)`.
 You can also pass `prob_threshold` or `nms_threshold` to one `predict(...)` call
