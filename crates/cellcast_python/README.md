@@ -242,6 +242,29 @@ For 4D input, the only accepted layout is `[B, C, Y, X]`; omit `axis` or pass
 `axis=1`. Batch prediction runs the Burn model forward pass once for the full
 batch, then runs StarDist NMS and label rendering per image.
 
+If you want to manage tiling yourself, ask the model for dense StarDist outputs
+and run NMS after stitching the dense arrays:
+
+```python
+prob, dist = model.predict_raw(tile_or_image)
+# prob shape: [Yg, Xg]
+# dist shape: [Yg, Xg, n_rays]
+
+labels = train.nms_stardist_2d(
+    prob,
+    dist,
+    grid=model.grid,
+    image_shape=(height, width),
+    prob_threshold=model.prob_threshold,
+    nms_threshold=model.nms_threshold,
+)
+```
+
+`predict_raw` also accepts `[B, C, Y, X]` batches and returns `prob` as
+`[B, Yg, Xg]` and `dist` as `[B, Yg, Xg, n_rays]`. The module-level
+`nms_stardist_2d` helper accepts those batched raw outputs too, but NMS is still
+run independently for each image.
+
 The saved training config controls preprocessing, including percentile
 normalization and thresholds. You can change persistent thresholds through
 `model.prob_threshold`, `model.nms_threshold`, or `model.set_thresholds(...)`.

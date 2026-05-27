@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use burn::module::Module;
 use burn::record::CompactRecorder;
 use burn::tensor::backend::Backend;
+use cellcast::models::stardist_2d::labels_from_prob_dist_2d;
 use cellcast::networks::stardist::trainable_2d::{TrainableStarDist2D, TrainableStarDist2DConfig};
 use cellcast::training::io_2d::{
     load_training_dataset_from_folder_with_options,
@@ -11,19 +12,20 @@ use cellcast::training::io_2d::{
     ImageChannels2D, LabelColorMode2D,
 };
 use cellcast::training::stardist_2d::{
-    predict_stardist_2d_batch_with_thresholds, predict_stardist_2d_with_thresholds,
-    save_stardist_2d, train_stardist_2d_with_callbacks, AugmentConfig2D, CpuInferBackend,
-    CpuTrainBackend, EpochEndEvent2D, EpochMetrics, LearningRateSchedule2D, Normalization2D,
-    PythonStarDist2DConfig, PythonThresholds, StarDistTrainError, StepMetrics2D,
-    TrainingCallbacks2D, TrainingConfig2D, TrainingPlan2D, TrainingResult2D, TrainingSample2D,
-    ValidationPreview2D, WgpuInferBackend, WgpuTrainBackend,
+    predict_stardist_2d_batch_raw, predict_stardist_2d_batch_with_thresholds,
+    predict_stardist_2d_raw, predict_stardist_2d_with_thresholds, save_stardist_2d,
+    train_stardist_2d_with_callbacks, AugmentConfig2D, CpuInferBackend, CpuTrainBackend,
+    EpochEndEvent2D, EpochMetrics, LearningRateSchedule2D, Normalization2D, PythonStarDist2DConfig,
+    PythonThresholds, StarDistTrainError, StepMetrics2D, TrainingCallbacks2D, TrainingConfig2D,
+    TrainingPlan2D, TrainingResult2D, TrainingSample2D, ValidationPreview2D, WgpuInferBackend,
+    WgpuTrainBackend,
 };
 use numpy::ndarray::{Array2, Array3, Array4, ArrayView2, ArrayView3, ArrayView4};
 use numpy::{IntoPyArray, PyReadonlyArray2, PyReadonlyArray3, PyReadonlyArray4};
 use pyo3::exceptions::PyTypeError;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList};
+use pyo3::types::{PyDict, PyList, PyTuple};
 
 use crate::error::stardist_train_error_to_pyerr;
 
@@ -66,6 +68,17 @@ enum PyPredictionOutput2D {
     Batch(Array3<u64>),
 }
 
+enum PyRawPredictionOutput2D {
+    Single {
+        prob: Array2<f32>,
+        dist: Array3<f32>,
+    },
+    Batch {
+        prob: Array3<f32>,
+        dist: Array4<f32>,
+    },
+}
+
 enum LoadedStarDist2DModel {
     Cpu {
         model: TrainableStarDist2D<CpuInferBackend>,
@@ -105,6 +118,27 @@ impl PyStarDist2DModel {
             .predict_input(&input, prob_threshold, nms_threshold)
             .map_err(stardist_train_error_to_pyerr)?;
         Ok(prediction_output_to_py(py, output))
+    }
+
+    /// Return dense StarDist outputs before NMS.
+    ///
+    /// Single-image input returns `(prob, dist)` with shapes
+    /// `[grid_y, grid_x]` and `[grid_y, grid_x, n_rays]`. Batch input in
+    /// `[B, C, Y, X]` returns `[B, grid_y, grid_x]` and
+    /// `[B, grid_y, grid_x, n_rays]`.
+    #[pyo3(signature = (data, axis=None))]
+    pub fn predict_raw<'py>(
+        &self,
+        py: Python<'py>,
+        data: Bound<'py, PyAny>,
+        axis: Option<usize>,
+    ) -> PyResult<Bound<'py, PyTuple>> {
+        let input = py_image_input_2d(&data, axis)?;
+        let output = self
+            .inner
+            .predict_raw_input(&input)
+            .map_err(stardist_train_error_to_pyerr)?;
+        raw_prediction_output_to_py(py, output)
     }
 
     #[getter]
@@ -225,6 +259,24 @@ impl LoadedStarDist2DModel {
                     nms_threshold,
                 )
             }
+        }
+    }
+
+    fn predict_raw_input(
+        &self,
+        input: &PyImageInput2D,
+    ) -> Result<PyRawPredictionOutput2D, StarDistTrainError> {
+        match self {
+            Self::Cpu {
+                model,
+                config,
+                device,
+            } => predict_raw_with_model_input(model, config, device, input),
+            Self::Wgpu {
+                model,
+                config,
+                device,
+            } => predict_raw_with_model_input(model, config, device, input),
         }
     }
 }
@@ -578,6 +630,67 @@ pub fn predict_trained_stardist_2d<'py>(
     )
 }
 
+/// Convert dense StarDist2D probability and distance maps into instance labels.
+///
+/// `prob` must be `[grid_y, grid_x]` and `dist` must be
+/// `[grid_y, grid_x, n_rays]`. For convenience, batched arrays
+/// `[B, grid_y, grid_x]` and `[B, grid_y, grid_x, n_rays]` are also accepted;
+/// NMS is then run independently for each batch item.
+#[pyfunction]
+#[pyo3(name = "nms_stardist_2d")]
+#[pyo3(signature = (
+    prob,
+    dist,
+    grid,
+    image_shape,
+    prob_threshold=0.5,
+    nms_threshold=0.4
+))]
+pub fn nms_stardist_2d_py<'py>(
+    py: Python<'py>,
+    prob: Bound<'py, PyAny>,
+    dist: Bound<'py, PyAny>,
+    grid: Vec<usize>,
+    image_shape: Vec<usize>,
+    prob_threshold: f32,
+    nms_threshold: f32,
+) -> PyResult<Bound<'py, PyAny>> {
+    let grid = parse_pair_usize(grid, "grid")?;
+    let image_shape = parse_pair_usize(image_shape, "image_shape")?;
+    validate_threshold("prob_threshold", prob_threshold)?;
+    validate_threshold("nms_threshold", nms_threshold)?;
+
+    if let Ok(prob) = prob.extract::<PyReadonlyArray2<f32>>() {
+        let dist = dist.extract::<PyReadonlyArray3<f32>>().map_err(|_| {
+            PyTypeError::new_err("dist must be a float32 NumPy array with shape [Yg, Xg, n_rays]")
+        })?;
+        let prob = prob.as_array().to_owned();
+        let dist = dist.as_array().to_owned();
+        let labels = py.detach(|| {
+            nms_stardist_2d_single(prob, dist, grid, image_shape, prob_threshold, nms_threshold)
+        })?;
+        return Ok(labels.into_pyarray(py).into_any());
+    }
+
+    if let Ok(prob) = prob.extract::<PyReadonlyArray3<f32>>() {
+        let dist = dist.extract::<PyReadonlyArray4<f32>>().map_err(|_| {
+            PyTypeError::new_err(
+                "dist must be a float32 NumPy array with shape [B, Yg, Xg, n_rays]",
+            )
+        })?;
+        let prob = prob.as_array().to_owned();
+        let dist = dist.as_array().to_owned();
+        let labels = py.detach(|| {
+            nms_stardist_2d_batch(prob, dist, grid, image_shape, prob_threshold, nms_threshold)
+        })?;
+        return Ok(labels.into_pyarray(py).into_any());
+    }
+
+    Err(PyTypeError::new_err(
+        "prob must be a float32 NumPy array with shape [Yg, Xg] or [B, Yg, Xg]",
+    ))
+}
+
 fn new_stardist_2d_from_config(
     config: TrainingConfig2D,
     use_gpu: bool,
@@ -887,6 +1000,30 @@ where
     }
 }
 
+fn predict_raw_with_model_input<B>(
+    model: &TrainableStarDist2D<B>,
+    config: &TrainingConfig2D,
+    device: &B::Device,
+    input: &PyImageInput2D,
+) -> Result<PyRawPredictionOutput2D, StarDistTrainError>
+where
+    B: Backend<FloatElem = f32, IntElem = i32>,
+{
+    match input {
+        PyImageInput2D::Single(image) => {
+            let prediction = predict_stardist_2d_raw(model, image, config, device)?;
+            Ok(PyRawPredictionOutput2D::Single {
+                prob: prediction.prob,
+                dist: prediction.dist,
+            })
+        }
+        PyImageInput2D::BatchBcyx(batch) => {
+            let predictions = predict_stardist_2d_batch_raw(model, batch, config, device)?;
+            predictions_to_raw_batch(predictions, config.n_rays)
+        }
+    }
+}
+
 fn prediction_output_to_py<'py>(
     py: Python<'py>,
     output: PyPredictionOutput2D,
@@ -895,6 +1032,160 @@ fn prediction_output_to_py<'py>(
         PyPredictionOutput2D::Single(labels) => labels.into_pyarray(py).into_any(),
         PyPredictionOutput2D::Batch(labels) => labels.into_pyarray(py).into_any(),
     }
+}
+
+fn raw_prediction_output_to_py<'py>(
+    py: Python<'py>,
+    output: PyRawPredictionOutput2D,
+) -> PyResult<Bound<'py, PyTuple>> {
+    match output {
+        PyRawPredictionOutput2D::Single { prob, dist } => {
+            let items = [
+                prob.into_pyarray(py).into_any(),
+                dist.into_pyarray(py).into_any(),
+            ];
+            PyTuple::new(py, items)
+        }
+        PyRawPredictionOutput2D::Batch { prob, dist } => {
+            let items = [
+                prob.into_pyarray(py).into_any(),
+                dist.into_pyarray(py).into_any(),
+            ];
+            PyTuple::new(py, items)
+        }
+    }
+}
+
+fn predictions_to_raw_batch(
+    predictions: Vec<cellcast::training::stardist_2d::Prediction2D>,
+    n_rays: usize,
+) -> Result<PyRawPredictionOutput2D, StarDistTrainError> {
+    let batch_size = predictions.len();
+    if batch_size == 0 {
+        return Err(StarDistTrainError::Shape(
+            "raw prediction batch must not be empty".to_string(),
+        ));
+    }
+    let (out_h, out_w) = predictions[0].prob.dim();
+    let mut prob = Array3::<f32>::zeros((batch_size, out_h, out_w));
+    let mut dist = Array4::<f32>::zeros((batch_size, out_h, out_w, n_rays));
+    for (batch_index, prediction) in predictions.into_iter().enumerate() {
+        let prob_dim = prediction.prob.dim();
+        let dist_dim = prediction.dist.dim();
+        if prob_dim != (out_h, out_w) || dist_dim != (out_h, out_w, n_rays) {
+            return Err(StarDistTrainError::Shape(format!(
+                "raw batch predictions have inconsistent shapes: prob {:?}, dist {:?}, expected prob ({}, {}) and dist ({}, {}, {})",
+                prob_dim, dist_dim, out_h, out_w, out_h, out_w, n_rays
+            )));
+        }
+        for y in 0..out_h {
+            for x in 0..out_w {
+                prob[[batch_index, y, x]] = prediction.prob[[y, x]];
+                for ray in 0..n_rays {
+                    dist[[batch_index, y, x, ray]] = prediction.dist[[y, x, ray]];
+                }
+            }
+        }
+    }
+    Ok(PyRawPredictionOutput2D::Batch { prob, dist })
+}
+
+fn parse_pair_usize(values: Vec<usize>, name: &str) -> PyResult<[usize; 2]> {
+    if values.len() != 2 {
+        return Err(PyValueError::new_err(format!(
+            "{name} must contain exactly two integers"
+        )));
+    }
+    if values[0] == 0 || values[1] == 0 {
+        return Err(PyValueError::new_err(format!(
+            "{name} entries must be positive"
+        )));
+    }
+    Ok([values[0], values[1]])
+}
+
+fn nms_stardist_2d_single(
+    prob: Array2<f32>,
+    dist: Array3<f32>,
+    grid: [usize; 2],
+    image_shape: [usize; 2],
+    prob_threshold: f32,
+    nms_threshold: f32,
+) -> PyResult<Array2<u64>> {
+    let prob_dim = prob.dim();
+    let dist_dim = dist.dim();
+    if dist_dim.0 != prob_dim.0 || dist_dim.1 != prob_dim.1 {
+        return Err(PyValueError::new_err(format!(
+            "prob and dist spatial shapes must match, got prob {:?} and dist {:?}",
+            prob_dim, dist_dim
+        )));
+    }
+    if dist_dim.2 < 3 {
+        return Err(PyValueError::new_err(
+            "dist must contain at least three rays in its last axis",
+        ));
+    }
+    Ok(labels_from_prob_dist_2d(
+        prob,
+        dist,
+        prob_threshold,
+        nms_threshold,
+        grid,
+        (image_shape[0], image_shape[1]),
+    ))
+}
+
+fn nms_stardist_2d_batch(
+    prob: Array3<f32>,
+    dist: Array4<f32>,
+    grid: [usize; 2],
+    image_shape: [usize; 2],
+    prob_threshold: f32,
+    nms_threshold: f32,
+) -> PyResult<Array3<u64>> {
+    let prob_dim = prob.dim();
+    let dist_dim = dist.dim();
+    if dist_dim.0 != prob_dim.0 || dist_dim.1 != prob_dim.1 || dist_dim.2 != prob_dim.2 {
+        return Err(PyValueError::new_err(format!(
+            "prob and dist shapes must match as [B, Yg, Xg] and [B, Yg, Xg, n_rays], got prob {:?} and dist {:?}",
+            prob_dim, dist_dim
+        )));
+    }
+    if dist_dim.3 < 3 {
+        return Err(PyValueError::new_err(
+            "dist must contain at least three rays in its last axis",
+        ));
+    }
+
+    let (batch_size, out_h, out_w) = prob_dim;
+    let n_rays = dist_dim.3;
+    let mut labels = Array3::<u64>::zeros((batch_size, image_shape[0], image_shape[1]));
+    for batch_index in 0..batch_size {
+        let mut prob_image = Array2::<f32>::zeros((out_h, out_w));
+        let mut dist_image = Array3::<f32>::zeros((out_h, out_w, n_rays));
+        for y in 0..out_h {
+            for x in 0..out_w {
+                prob_image[[y, x]] = prob[[batch_index, y, x]];
+                for ray in 0..n_rays {
+                    dist_image[[y, x, ray]] = dist[[batch_index, y, x, ray]];
+                }
+            }
+        }
+        let label_image = labels_from_prob_dist_2d(
+            prob_image,
+            dist_image,
+            prob_threshold,
+            nms_threshold,
+            grid,
+            (image_shape[0], image_shape[1]),
+        );
+        for y in 0..image_shape[0] {
+            for x in 0..image_shape[1] {
+                labels[[batch_index, y, x]] = label_image[[y, x]];
+            }
+        }
+    }
+    Ok(labels)
 }
 
 fn py_image_input_2d(data: &Bound<'_, PyAny>, axis: Option<usize>) -> PyResult<PyImageInput2D> {
