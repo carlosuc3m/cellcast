@@ -184,6 +184,29 @@ for path in ["image_001.tif", "image_002.tif"]:
 del model
 ```
 
+To create a new randomly initialized model instead of loading trained
+artifacts, use `new_stardist_2d`. This uses the default `TrainingConfig2D`
+values unless a config dictionary is provided. Predictions from this model are
+not meaningful until weights have been trained.
+
+```python
+import cellcast.training.stardist_2d as train
+
+model = train.new_stardist_2d(gpu=False)
+
+rgb_model = train.new_stardist_2d(
+    config={
+        "n_channel_in": 3,
+        "n_rays": 32,
+        "grid": [1, 1],
+        "patch_size": [256, 256],
+        "normalization": "percentile",
+        "normalization_percentiles": [1.0, 99.8],
+    },
+    gpu=True,
+)
+```
+
 For multi-channel inputs, pass `axis` to identify the channel dimension. The
 saved training config controls preprocessing, including percentile
 normalization and thresholds, unless `prob_threshold` or `nms_threshold` are

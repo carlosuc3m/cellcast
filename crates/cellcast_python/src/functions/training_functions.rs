@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use burn::tensor::backend::Backend;
-use cellcast::networks::stardist::trainable_2d::TrainableStarDist2D;
+use cellcast::networks::stardist::trainable_2d::{TrainableStarDist2D, TrainableStarDist2DConfig};
 use cellcast::training::io_2d::{
     load_training_dataset_from_folder_with_options,
     load_training_samples_from_folders_with_options, split_train_valid_2d, FolderDatasetOptions2D,
@@ -154,6 +154,49 @@ impl LoadedStarDist2DModel {
                 )
             }
         }
+    }
+}
+
+/// Create a randomly initialized StarDist2D model.
+///
+/// This does not load trained weights. It is useful for inspecting config,
+/// checking device availability, or future workflows that train/update an
+/// already-created model.
+#[pyfunction]
+#[pyo3(name = "new_stardist_2d")]
+#[pyo3(signature = (config=None, gpu=None))]
+pub fn new_stardist_2d(
+    config: Option<Bound<'_, PyDict>>,
+    gpu: Option<bool>,
+) -> PyResult<PyStarDist2DModel> {
+    let config = training_config_from_pydict(config.as_ref())?;
+
+    if gpu.unwrap_or(false) {
+        let device = Default::default();
+        WgpuInferBackend::seed(&device, config.seed);
+        let model_config =
+            TrainableStarDist2DConfig::new(config.n_channel_in, config.n_rays, config.grid);
+        let model = model_config.init::<WgpuInferBackend>(&device);
+        Ok(PyStarDist2DModel {
+            inner: LoadedStarDist2DModel::Wgpu {
+                model,
+                config,
+                device,
+            },
+        })
+    } else {
+        let device = Default::default();
+        CpuInferBackend::seed(&device, config.seed);
+        let model_config =
+            TrainableStarDist2DConfig::new(config.n_channel_in, config.n_rays, config.grid);
+        let model = model_config.init::<CpuInferBackend>(&device);
+        Ok(PyStarDist2DModel {
+            inner: LoadedStarDist2DModel::Cpu {
+                model,
+                config,
+                device,
+            },
+        })
     }
 }
 
@@ -643,6 +686,15 @@ where
         }
         _ => Err(PyValueError::new_err("axis must be 0, 1, or 2")),
     }
+}
+
+fn training_config_from_pydict(dict: Option<&Bound<'_, PyDict>>) -> PyResult<TrainingConfig2D> {
+    let mut config = TrainingConfig2D::default();
+    if let Some(dict) = dict {
+        apply_training_config_dict(&mut config, dict)?;
+    }
+    config.validate().map_err(stardist_train_error_to_pyerr)?;
+    Ok(config)
 }
 
 fn apply_training_config_dict(
