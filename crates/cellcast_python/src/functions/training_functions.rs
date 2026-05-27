@@ -1,5 +1,8 @@
-use std::path::PathBuf;
+use std::fs;
+use std::path::{Path, PathBuf};
 
+use burn::module::Module;
+use burn::record::CompactRecorder;
 use burn::tensor::backend::Backend;
 use cellcast::networks::stardist::trainable_2d::{TrainableStarDist2D, TrainableStarDist2DConfig};
 use cellcast::training::io_2d::{
@@ -8,9 +11,9 @@ use cellcast::training::io_2d::{
     ImageChannels2D, LabelColorMode2D,
 };
 use cellcast::training::stardist_2d::{
-    load_stardist_2d as load_stardist_2d_artifacts, predict_stardist_2d_with_thresholds,
-    save_stardist_2d, train_stardist_2d_with_callbacks, AugmentConfig2D, CpuInferBackend,
-    CpuTrainBackend, EpochEndEvent2D, EpochMetrics, LearningRateSchedule2D, Normalization2D,
+    predict_stardist_2d_with_thresholds, save_stardist_2d, train_stardist_2d_with_callbacks,
+    AugmentConfig2D, CpuInferBackend, CpuTrainBackend, EpochEndEvent2D, EpochMetrics,
+    LearningRateSchedule2D, Normalization2D, PythonStarDist2DConfig, PythonThresholds,
     StarDistTrainError, StepMetrics2D, TrainingCallbacks2D, TrainingConfig2D, TrainingPlan2D,
     TrainingResult2D, TrainingSample2D, ValidationPreview2D, WgpuInferBackend, WgpuTrainBackend,
 };
@@ -39,6 +42,17 @@ struct PythonTrainingCallbacks2D {
     on_train_begin: Option<Py<PyAny>>,
     on_step_end: Option<Py<PyAny>>,
     on_validation_end: Option<Py<PyAny>>,
+}
+
+enum StarDist2DLoadSource {
+    New,
+    ConfigJson(PathBuf),
+    Trained(TrainedStarDist2DSource),
+}
+
+enum TrainedStarDist2DSource {
+    ArtifactDir(PathBuf),
+    ModelFile(PathBuf),
 }
 
 enum LoadedStarDist2DModel {
@@ -102,6 +116,47 @@ impl PyStarDist2DModel {
         self.inner.config().grid
     }
 
+    #[getter]
+    pub fn prob_threshold(&self) -> f32 {
+        self.inner.config().prob_threshold
+    }
+
+    #[setter]
+    pub fn set_prob_threshold(&mut self, value: f32) -> PyResult<()> {
+        validate_threshold("prob_threshold", value)?;
+        self.inner.config_mut().prob_threshold = value;
+        Ok(())
+    }
+
+    #[getter]
+    pub fn nms_threshold(&self) -> f32 {
+        self.inner.config().nms_threshold
+    }
+
+    #[setter]
+    pub fn set_nms_threshold(&mut self, value: f32) -> PyResult<()> {
+        validate_threshold("nms_threshold", value)?;
+        self.inner.config_mut().nms_threshold = value;
+        Ok(())
+    }
+
+    #[pyo3(signature = (prob_threshold=None, nms_threshold=None))]
+    pub fn set_thresholds(
+        &mut self,
+        prob_threshold: Option<f32>,
+        nms_threshold: Option<f32>,
+    ) -> PyResult<()> {
+        if let Some(value) = prob_threshold {
+            validate_threshold("prob_threshold", value)?;
+            self.inner.config_mut().prob_threshold = value;
+        }
+        if let Some(value) = nms_threshold {
+            validate_threshold("nms_threshold", value)?;
+            self.inner.config_mut().nms_threshold = value;
+        }
+        Ok(())
+    }
+
     pub fn config<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         training_config_to_pydict(py, self.inner.config())
     }
@@ -109,6 +164,12 @@ impl PyStarDist2DModel {
 
 impl LoadedStarDist2DModel {
     fn config(&self) -> &TrainingConfig2D {
+        match self {
+            Self::Cpu { config, .. } | Self::Wgpu { config, .. } => config,
+        }
+    }
+
+    fn config_mut(&mut self) -> &mut TrainingConfig2D {
         match self {
             Self::Cpu { config, .. } | Self::Wgpu { config, .. } => config,
         }
@@ -169,35 +230,8 @@ pub fn new_stardist_2d(
     config: Option<Bound<'_, PyDict>>,
     gpu: Option<bool>,
 ) -> PyResult<PyStarDist2DModel> {
-    let config = training_config_from_pydict(config.as_ref())?;
-
-    if gpu.unwrap_or(false) {
-        let device = Default::default();
-        WgpuInferBackend::seed(&device, config.seed);
-        let model_config =
-            TrainableStarDist2DConfig::new(config.n_channel_in, config.n_rays, config.grid);
-        let model = model_config.init::<WgpuInferBackend>(&device);
-        Ok(PyStarDist2DModel {
-            inner: LoadedStarDist2DModel::Wgpu {
-                model,
-                config,
-                device,
-            },
-        })
-    } else {
-        let device = Default::default();
-        CpuInferBackend::seed(&device, config.seed);
-        let model_config =
-            TrainableStarDist2DConfig::new(config.n_channel_in, config.n_rays, config.grid);
-        let model = model_config.init::<CpuInferBackend>(&device);
-        Ok(PyStarDist2DModel {
-            inner: LoadedStarDist2DModel::Cpu {
-                model,
-                config,
-                device,
-            },
-        })
-    }
+    let config = training_config_from_pydict(TrainingConfig2D::default(), config.as_ref())?;
+    new_stardist_2d_from_config(config, gpu.unwrap_or(false))
 }
 
 impl PythonTrainingCallbacks2D {
@@ -436,37 +470,69 @@ pub fn predict_stardist_2d_saved<'py>(
     Ok(labels.into_pyarray(py))
 }
 
-/// Load a trained StarDist2D model once for repeated inference.
+/// Load or create a StarDist2D model once for repeated inference.
 ///
-/// The returned object owns the Rust model and backend device. When Python
-/// releases the last reference to the object, Rust drops those resources.
+/// If `source` is omitted, a new randomly initialized model is created from the
+/// default config plus optional config overrides. If `source` is a JSON config,
+/// a new randomly initialized model is created from that config. If `source` is
+/// an artifact directory or `model.mpk`, trained weights are loaded and only
+/// safe inference overrides, such as thresholds, are applied.
 #[pyfunction]
 #[pyo3(name = "load_stardist_2d")]
-#[pyo3(signature = (model_dir, gpu=None))]
-pub fn load_stardist_2d_saved(model_dir: String, gpu: Option<bool>) -> PyResult<PyStarDist2DModel> {
-    if gpu.unwrap_or(false) {
-        let device = Default::default();
-        let (model, config) =
-            load_stardist_2d_artifacts::<WgpuInferBackend, _>(&model_dir, &device)
-                .map_err(stardist_train_error_to_pyerr)?;
-        Ok(PyStarDist2DModel {
-            inner: LoadedStarDist2DModel::Wgpu {
-                model,
-                config,
-                device,
-            },
-        })
-    } else {
-        let device = Default::default();
-        let (model, config) = load_stardist_2d_artifacts::<CpuInferBackend, _>(&model_dir, &device)
-            .map_err(stardist_train_error_to_pyerr)?;
-        Ok(PyStarDist2DModel {
-            inner: LoadedStarDist2DModel::Cpu {
-                model,
-                config,
-                device,
-            },
-        })
+#[pyo3(signature = (source=None, gpu=None, config=None, model_dir=None))]
+pub fn load_stardist_2d_saved(
+    source: Option<String>,
+    gpu: Option<bool>,
+    config: Option<Bound<'_, PyDict>>,
+    model_dir: Option<String>,
+) -> PyResult<PyStarDist2DModel> {
+    let source = merge_model_source(source, model_dir)?;
+    let source =
+        classify_stardist_2d_source(source.as_deref()).map_err(stardist_train_error_to_pyerr)?;
+    let use_gpu = gpu.unwrap_or(false);
+
+    match source {
+        StarDist2DLoadSource::New => {
+            let config = training_config_from_pydict(TrainingConfig2D::default(), config.as_ref())?;
+            new_stardist_2d_from_config(config, use_gpu)
+        }
+        StarDist2DLoadSource::ConfigJson(path) => {
+            let base =
+                training_config_from_json_path(&path).map_err(stardist_train_error_to_pyerr)?;
+            let config = training_config_from_pydict(base, config.as_ref())?;
+            new_stardist_2d_from_config(config, use_gpu)
+        }
+        StarDist2DLoadSource::Trained(source) => {
+            if use_gpu {
+                let device = Default::default();
+                let (model, config) = load_trained_stardist_2d_backend::<WgpuInferBackend>(
+                    &source,
+                    config.as_ref(),
+                    &device,
+                )?;
+                Ok(PyStarDist2DModel {
+                    inner: LoadedStarDist2DModel::Wgpu {
+                        model,
+                        config,
+                        device,
+                    },
+                })
+            } else {
+                let device = Default::default();
+                let (model, config) = load_trained_stardist_2d_backend::<CpuInferBackend>(
+                    &source,
+                    config.as_ref(),
+                    &device,
+                )?;
+                Ok(PyStarDist2DModel {
+                    inner: LoadedStarDist2DModel::Cpu {
+                        model,
+                        config,
+                        device,
+                    },
+                })
+            }
+        }
     }
 }
 
@@ -499,6 +565,213 @@ pub fn predict_trained_stardist_2d<'py>(
         axis,
         gpu,
     )
+}
+
+fn new_stardist_2d_from_config(
+    config: TrainingConfig2D,
+    use_gpu: bool,
+) -> PyResult<PyStarDist2DModel> {
+    if use_gpu {
+        let device = Default::default();
+        WgpuInferBackend::seed(&device, config.seed);
+        let model_config =
+            TrainableStarDist2DConfig::new(config.n_channel_in, config.n_rays, config.grid);
+        let model = model_config.init::<WgpuInferBackend>(&device);
+        Ok(PyStarDist2DModel {
+            inner: LoadedStarDist2DModel::Wgpu {
+                model,
+                config,
+                device,
+            },
+        })
+    } else {
+        let device = Default::default();
+        CpuInferBackend::seed(&device, config.seed);
+        let model_config =
+            TrainableStarDist2DConfig::new(config.n_channel_in, config.n_rays, config.grid);
+        let model = model_config.init::<CpuInferBackend>(&device);
+        Ok(PyStarDist2DModel {
+            inner: LoadedStarDist2DModel::Cpu {
+                model,
+                config,
+                device,
+            },
+        })
+    }
+}
+
+fn load_trained_stardist_2d_backend<B>(
+    source: &TrainedStarDist2DSource,
+    config_overrides: Option<&Bound<'_, PyDict>>,
+    device: &B::Device,
+) -> PyResult<(TrainableStarDist2D<B>, TrainingConfig2D)>
+where
+    B: Backend<FloatElem = f32, IntElem = i32>,
+{
+    let (model, mut config) = load_trained_stardist_2d_backend_result::<B>(source, device)
+        .map_err(stardist_train_error_to_pyerr)?;
+    apply_trained_model_config_overrides(&mut config, config_overrides)?;
+    config.validate().map_err(stardist_train_error_to_pyerr)?;
+    Ok((model, config))
+}
+
+fn load_trained_stardist_2d_backend_result<B>(
+    source: &TrainedStarDist2DSource,
+    device: &B::Device,
+) -> Result<(TrainableStarDist2D<B>, TrainingConfig2D), StarDistTrainError>
+where
+    B: Backend<FloatElem = f32, IntElem = i32>,
+{
+    let (artifact_dir, model_stem) = match source {
+        TrainedStarDist2DSource::ArtifactDir(artifact_dir) => {
+            ensure_model_file_exists(artifact_dir)?;
+            (artifact_dir.as_path(), artifact_dir.join("model"))
+        }
+        TrainedStarDist2DSource::ModelFile(model_file) => {
+            let artifact_dir = model_file.parent().unwrap_or_else(|| Path::new("."));
+            (artifact_dir, compact_recorder_stem(model_file)?)
+        }
+    };
+
+    let config = read_saved_training_config(artifact_dir)?;
+    let model_config =
+        TrainableStarDist2DConfig::new(config.n_channel_in, config.n_rays, config.grid);
+    let model = model_config.init::<B>(device);
+    let recorder = CompactRecorder::new();
+    let model = model.load_file(model_stem, &recorder, device)?;
+    Ok((model, config))
+}
+
+fn merge_model_source(
+    source: Option<String>,
+    model_dir: Option<String>,
+) -> PyResult<Option<String>> {
+    match (source, model_dir) {
+        (Some(_), Some(_)) => Err(PyValueError::new_err(
+            "pass only one of source or model_dir to load_stardist_2d",
+        )),
+        (Some(source), None) => Ok(Some(source)),
+        (None, Some(model_dir)) => Ok(Some(model_dir)),
+        (None, None) => Ok(None),
+    }
+}
+
+fn classify_stardist_2d_source(
+    source: Option<&str>,
+) -> Result<StarDist2DLoadSource, StarDistTrainError> {
+    let Some(source) = source else {
+        return Ok(StarDist2DLoadSource::New);
+    };
+    let path = PathBuf::from(source);
+    if path.is_dir() {
+        return Ok(StarDist2DLoadSource::Trained(
+            TrainedStarDist2DSource::ArtifactDir(path),
+        ));
+    }
+    if is_json_path(&path) {
+        if path.is_file() {
+            return Ok(StarDist2DLoadSource::ConfigJson(path));
+        }
+        return Err(StarDistTrainError::InvalidConfig(format!(
+            "StarDist2D config JSON does not exist: {}",
+            path.display()
+        )));
+    }
+    classify_trained_stardist_2d_source(&path).map(StarDist2DLoadSource::Trained)
+}
+
+fn classify_trained_stardist_2d_source(
+    path: &Path,
+) -> Result<TrainedStarDist2DSource, StarDistTrainError> {
+    if path.is_dir() {
+        return Ok(TrainedStarDist2DSource::ArtifactDir(path.to_path_buf()));
+    }
+    if is_mpk_path(path) {
+        if path.is_file() {
+            return Ok(TrainedStarDist2DSource::ModelFile(path.to_path_buf()));
+        }
+        return Err(StarDistTrainError::InvalidConfig(format!(
+            "StarDist2D model file does not exist: {}",
+            path.display()
+        )));
+    }
+    Err(StarDistTrainError::InvalidConfig(format!(
+        "load_stardist_2d source must be None, a config .json file, an artifact directory, or a model .mpk file; got {}",
+        path.display()
+    )))
+}
+
+fn read_saved_training_config(artifact_dir: &Path) -> Result<TrainingConfig2D, StarDistTrainError> {
+    let cellcast_config_path = artifact_dir.join("cellcast_config.json");
+    let python_config_path = artifact_dir.join("config.json");
+    let mut config = if cellcast_config_path.is_file() {
+        training_config_from_json_path_result(&cellcast_config_path)?
+    } else if python_config_path.is_file() {
+        training_config_from_json_path_result(&python_config_path)?
+    } else {
+        return Err(StarDistTrainError::InvalidConfig(format!(
+            "cannot load trained StarDist2D weights because no cellcast_config.json or config.json was found next to the model in {}",
+            artifact_dir.display()
+        )));
+    };
+
+    apply_saved_thresholds(artifact_dir, &mut config)?;
+    config.validate()?;
+    Ok(config)
+}
+
+fn apply_saved_thresholds(
+    artifact_dir: &Path,
+    config: &mut TrainingConfig2D,
+) -> Result<(), StarDistTrainError> {
+    let thresholds_path = artifact_dir.join("thresholds.json");
+    if thresholds_path.is_file() {
+        let thresholds: PythonThresholds = serde_json::from_slice(&fs::read(thresholds_path)?)?;
+        config.prob_threshold = thresholds.prob;
+        config.nms_threshold = thresholds.nms;
+    }
+    Ok(())
+}
+
+fn ensure_model_file_exists(artifact_dir: &Path) -> Result<(), StarDistTrainError> {
+    let model_path = artifact_dir.join("model.mpk");
+    if !model_path.is_file() {
+        return Err(StarDistTrainError::InvalidConfig(format!(
+            "StarDist2D artifact directory {} does not contain model.mpk",
+            artifact_dir.display()
+        )));
+    }
+    Ok(())
+}
+
+fn compact_recorder_stem(model_file: &Path) -> Result<PathBuf, StarDistTrainError> {
+    if !is_mpk_path(model_file) {
+        return Err(StarDistTrainError::InvalidConfig(format!(
+            "StarDist2D model file must end in .mpk: {}",
+            model_file.display()
+        )));
+    }
+    let Some(stem) = model_file.file_stem() else {
+        return Err(StarDistTrainError::InvalidConfig(format!(
+            "invalid StarDist2D model file path: {}",
+            model_file.display()
+        )));
+    };
+    Ok(model_file.with_file_name(stem))
+}
+
+fn is_json_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| extension.eq_ignore_ascii_case("json"))
+        .unwrap_or(false)
+}
+
+fn is_mpk_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| extension.eq_ignore_ascii_case("mpk"))
+        .unwrap_or(false)
 }
 
 fn run_training_backend<B>(
@@ -542,7 +815,7 @@ where
 }
 
 fn predict_saved_backend<B>(
-    model_dir: &str,
+    model_source: &str,
     image: &Array3<f32>,
     prob_threshold: Option<f32>,
     nms_threshold: Option<f32>,
@@ -552,7 +825,8 @@ where
     B::Device: Default,
 {
     let device = Default::default();
-    let (model, config) = load_stardist_2d_artifacts::<B, _>(model_dir, &device)?;
+    let source = classify_trained_stardist_2d_source(Path::new(model_source))?;
+    let (model, config) = load_trained_stardist_2d_backend_result::<B>(&source, &device)?;
     let prob_threshold = prob_threshold.unwrap_or(config.prob_threshold);
     let nms_threshold = nms_threshold.unwrap_or(config.nms_threshold);
     predict_stardist_2d_with_thresholds(
@@ -688,13 +962,110 @@ where
     }
 }
 
-fn training_config_from_pydict(dict: Option<&Bound<'_, PyDict>>) -> PyResult<TrainingConfig2D> {
-    let mut config = TrainingConfig2D::default();
+fn training_config_from_pydict(
+    mut config: TrainingConfig2D,
+    dict: Option<&Bound<'_, PyDict>>,
+) -> PyResult<TrainingConfig2D> {
     if let Some(dict) = dict {
         apply_training_config_dict(&mut config, dict)?;
     }
     config.validate().map_err(stardist_train_error_to_pyerr)?;
     Ok(config)
+}
+
+fn training_config_from_json_path(path: &Path) -> Result<TrainingConfig2D, StarDistTrainError> {
+    let mut config = training_config_from_json_path_result(path)?;
+    apply_saved_thresholds(path.parent().unwrap_or_else(|| Path::new(".")), &mut config)?;
+    config.validate()?;
+    Ok(config)
+}
+
+fn training_config_from_json_path_result(
+    path: &Path,
+) -> Result<TrainingConfig2D, StarDistTrainError> {
+    let bytes = fs::read(path)?;
+    if let Ok(config) = serde_json::from_slice::<TrainingConfig2D>(&bytes) {
+        return Ok(config);
+    }
+    let python_config: PythonStarDist2DConfig = serde_json::from_slice(&bytes)?;
+    Ok(training_config_from_python_config(python_config))
+}
+
+fn training_config_from_python_config(python_config: PythonStarDist2DConfig) -> TrainingConfig2D {
+    let mut config = TrainingConfig2D::default();
+    config.n_channel_in = python_config.n_channel_in;
+    config.n_rays = python_config.n_rays;
+    config.grid = python_config.grid;
+    config.patch_size = python_config.train_patch_size;
+    config.batch_size = python_config.train_batch_size;
+    config.epochs = python_config.train_epochs;
+    config.steps_per_epoch = python_config.train_steps_per_epoch;
+    config.learning_rate = python_config.train_learning_rate;
+    config.background_reg = python_config.train_background_reg;
+    config.foreground_probability = python_config.train_foreground_only;
+    config.loss_prob_weight = python_config.train_loss_weights[0];
+    config.loss_dist_weight = python_config.train_loss_weights[1];
+    config.shape_completion = python_config.train_shape_completion;
+    config.completion_crop = python_config.train_completion_crop;
+    config.lr_schedule = LearningRateSchedule2D::ReduceOnPlateau {
+        factor: python_config.train_reduce_lr.factor as f64,
+        patience: python_config.train_reduce_lr.patience,
+        min_delta: python_config.train_reduce_lr.min_delta,
+        min_learning_rate: 0.0,
+    };
+    config
+}
+
+fn apply_trained_model_config_overrides(
+    config: &mut TrainingConfig2D,
+    dict: Option<&Bound<'_, PyDict>>,
+) -> PyResult<()> {
+    let Some(dict) = dict else {
+        return Ok(());
+    };
+
+    if let Some(value) = config_usize(Some(dict), "n_channel_in")? {
+        ensure_structural_config_matches("n_channel_in", config.n_channel_in, value)?;
+    }
+    if let Some(value) = config_usize(Some(dict), "n_rays")? {
+        ensure_structural_config_matches("n_rays", config.n_rays, value)?;
+    }
+    if let Some(value) = config_pair_usize(Some(dict), "grid")? {
+        if value != config.grid {
+            return Err(PyValueError::new_err(format!(
+                "cannot override grid for a trained model: saved model uses {:?}, requested {:?}",
+                config.grid, value
+            )));
+        }
+    }
+    if let Some(value) = config_f32(Some(dict), "prob_threshold")? {
+        validate_threshold("prob_threshold", value)?;
+        config.prob_threshold = value;
+    }
+    if let Some(value) = config_f32(Some(dict), "nms_threshold")? {
+        validate_threshold("nms_threshold", value)?;
+        config.nms_threshold = value;
+    }
+    apply_normalization_config(config, dict)?;
+    Ok(())
+}
+
+fn ensure_structural_config_matches(name: &str, saved: usize, requested: usize) -> PyResult<()> {
+    if saved == requested {
+        Ok(())
+    } else {
+        Err(PyValueError::new_err(format!(
+            "cannot override {name} for a trained model: saved model uses {saved}, requested {requested}"
+        )))
+    }
+}
+
+fn validate_threshold(name: &str, value: f32) -> PyResult<()> {
+    if value.is_finite() && (0.0..=1.0).contains(&value) {
+        Ok(())
+    } else {
+        Err(PyValueError::new_err(format!("{name} must be in [0, 1]")))
+    }
 }
 
 fn apply_training_config_dict(
@@ -744,9 +1115,11 @@ fn apply_training_config_dict(
         config.loss_dist_weight = value;
     }
     if let Some(value) = config_f32(Some(dict), "prob_threshold")? {
+        validate_threshold("prob_threshold", value)?;
         config.prob_threshold = value;
     }
     if let Some(value) = config_f32(Some(dict), "nms_threshold")? {
+        validate_threshold("nms_threshold", value)?;
         config.nms_threshold = value;
     }
     if let Some(value) = config_u64(Some(dict), "seed")? {

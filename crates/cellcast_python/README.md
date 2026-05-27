@@ -175,6 +175,7 @@ import tifffile
 import cellcast.training.stardist_2d as train
 
 model = train.load_stardist_2d("artifacts/stardist2d", gpu=True)
+model.set_thresholds(prob_threshold=0.45, nms_threshold=0.3)
 
 for path in ["image_001.tif", "image_002.tif"]:
     image = tifffile.imread(path)
@@ -184,17 +185,37 @@ for path in ["image_001.tif", "image_002.tif"]:
 del model
 ```
 
+Trained artifacts are expected to use this folder layout:
+
+```text
+model_folder/
+  model.mpk
+  cellcast_config.json
+  config.json
+  thresholds.json
+```
+
+`load_stardist_2d` accepts either the folder path or the `model.mpk` path:
+
+```python
+model = train.load_stardist_2d("model_folder", gpu=True)
+same_model = train.load_stardist_2d("model_folder/model.mpk", gpu=True)
+```
+
 To create a new randomly initialized model instead of loading trained
-artifacts, use `new_stardist_2d`. This uses the default `TrainingConfig2D`
-values unless a config dictionary is provided. Predictions from this model are
-not meaningful until weights have been trained.
+artifacts, call `load_stardist_2d` without a source, or pass a config JSON. This
+uses the default `TrainingConfig2D` values unless a config dictionary is
+provided. Predictions from this model are not meaningful until weights have been
+trained.
 
 ```python
 import cellcast.training.stardist_2d as train
 
-model = train.new_stardist_2d(gpu=False)
+model = train.load_stardist_2d(gpu=False)
 
-rgb_model = train.new_stardist_2d(
+json_model = train.load_stardist_2d("cellcast_config.json", gpu=False)
+
+rgb_model = train.load_stardist_2d(
     config={
         "n_channel_in": 3,
         "n_rays": 32,
@@ -209,8 +230,10 @@ rgb_model = train.new_stardist_2d(
 
 For multi-channel inputs, pass `axis` to identify the channel dimension. The
 saved training config controls preprocessing, including percentile
-normalization and thresholds, unless `prob_threshold` or `nms_threshold` are
-provided explicitly.
+normalization and thresholds. You can change persistent thresholds through
+`model.prob_threshold`, `model.nms_threshold`, or `model.set_thresholds(...)`.
+You can also pass `prob_threshold` or `nms_threshold` to one `predict(...)` call
+without changing the model object.
 
 ## License
 
