@@ -228,10 +228,10 @@ impl LoadedStarDist2DModel {
 #[pyo3(signature = (config=None, gpu=None))]
 pub fn new_stardist_2d(
     config: Option<Bound<'_, PyDict>>,
-    gpu: Option<bool>,
+    gpu: Option<Bound<'_, PyAny>>,
 ) -> PyResult<PyStarDist2DModel> {
     let config = training_config_from_pydict(TrainingConfig2D::default(), config.as_ref())?;
-    new_stardist_2d_from_config(config, gpu.unwrap_or(false))
+    new_stardist_2d_from_config(config, parse_bool_argument(gpu.as_ref(), "gpu")?)
 }
 
 impl PythonTrainingCallbacks2D {
@@ -482,14 +482,14 @@ pub fn predict_stardist_2d_saved<'py>(
 #[pyo3(signature = (source=None, gpu=None, config=None, model_dir=None))]
 pub fn load_stardist_2d_saved(
     source: Option<String>,
-    gpu: Option<bool>,
+    gpu: Option<Bound<'_, PyAny>>,
     config: Option<Bound<'_, PyDict>>,
     model_dir: Option<String>,
 ) -> PyResult<PyStarDist2DModel> {
     let source = merge_model_source(source, model_dir)?;
     let source =
         classify_stardist_2d_source(source.as_deref()).map_err(stardist_train_error_to_pyerr)?;
-    let use_gpu = gpu.unwrap_or(false);
+    let use_gpu = parse_bool_argument(gpu.as_ref(), "gpu")?;
 
     match source {
         StarDist2DLoadSource::New => {
@@ -987,8 +987,11 @@ fn training_config_from_json_path_result(
     if let Ok(config) = serde_json::from_slice::<TrainingConfig2D>(&bytes) {
         return Ok(config);
     }
-    let python_config: PythonStarDist2DConfig = serde_json::from_slice(&bytes)?;
-    Ok(training_config_from_python_config(python_config))
+    if let Ok(python_config) = serde_json::from_slice::<PythonStarDist2DConfig>(&bytes) {
+        return Ok(training_config_from_python_config(python_config));
+    }
+    let value: serde_json::Value = serde_json::from_slice(&bytes)?;
+    training_config_from_json_value(&value)
 }
 
 fn training_config_from_python_config(python_config: PythonStarDist2DConfig) -> TrainingConfig2D {
@@ -1014,6 +1017,97 @@ fn training_config_from_python_config(python_config: PythonStarDist2DConfig) -> 
         min_learning_rate: 0.0,
     };
     config
+}
+
+fn training_config_from_json_value(
+    value: &serde_json::Value,
+) -> Result<TrainingConfig2D, StarDistTrainError> {
+    let mut config = TrainingConfig2D::default();
+    if let Some(value) = json_usize(value, "n_channel_in")? {
+        config.n_channel_in = value;
+    }
+    if let Some(value) = json_usize(value, "n_rays")? {
+        config.n_rays = value;
+    }
+    if let Some(value) = json_pair_usize(value, "grid")? {
+        config.grid = value;
+    }
+    if let Some(value) =
+        json_pair_usize(value, "patch_size")?.or(json_pair_usize(value, "train_patch_size")?)
+    {
+        config.patch_size = value;
+    }
+    if let Some(value) = json_usize(value, "batch_size")?.or(json_usize(value, "train_batch_size")?)
+    {
+        config.batch_size = value;
+    }
+    if let Some(value) = json_usize(value, "epochs")?.or(json_usize(value, "train_epochs")?) {
+        config.epochs = value;
+    }
+    if let Some(value) =
+        json_usize(value, "steps_per_epoch")?.or(json_usize(value, "train_steps_per_epoch")?)
+    {
+        config.steps_per_epoch = value;
+    }
+    if let Some(value) = json_usize(value, "validation_steps")? {
+        config.validation_steps = value;
+    }
+    if let Some(value) =
+        json_f64(value, "learning_rate")?.or(json_f64(value, "train_learning_rate")?)
+    {
+        config.learning_rate = value;
+    }
+    if let Some(value) =
+        json_f32(value, "background_reg")?.or(json_f32(value, "train_background_reg")?)
+    {
+        config.background_reg = value;
+    }
+    if let Some(value) =
+        json_f32(value, "foreground_probability")?.or(json_f32(value, "train_foreground_only")?)
+    {
+        config.foreground_probability = value;
+    }
+    if let Some(values) = json_vec_f32(value, "train_loss_weights")? {
+        if values.len() == 2 {
+            config.loss_prob_weight = values[0];
+            config.loss_dist_weight = values[1];
+        }
+    }
+    if let Some(value) = json_f32(value, "loss_prob_weight")? {
+        config.loss_prob_weight = value;
+    }
+    if let Some(value) = json_f32(value, "loss_dist_weight")? {
+        config.loss_dist_weight = value;
+    }
+    if let Some(value) =
+        json_bool(value, "shape_completion")?.or(json_bool(value, "train_shape_completion")?)
+    {
+        config.shape_completion = value;
+    }
+    if let Some(value) =
+        json_usize(value, "completion_crop")?.or(json_usize(value, "train_completion_crop")?)
+    {
+        config.completion_crop = value;
+    }
+    if let Some(value) = json_f32(value, "prob_threshold")? {
+        config.prob_threshold = value;
+    }
+    if let Some(value) = json_f32(value, "nms_threshold")? {
+        config.nms_threshold = value;
+    }
+    if let Some(reduce_lr) = json_get(value, "train_reduce_lr") {
+        let factor = json_f64(reduce_lr, "factor")?.unwrap_or(0.5);
+        let patience = json_usize(reduce_lr, "patience")?.unwrap_or(40);
+        let min_delta = json_f32(reduce_lr, "min_delta")?.unwrap_or(0.0);
+        config.lr_schedule = LearningRateSchedule2D::ReduceOnPlateau {
+            factor,
+            patience,
+            min_delta,
+            min_learning_rate: 0.0,
+        };
+    }
+    config.validate()?;
+    Ok(config)
 }
 
 fn apply_trained_model_config_overrides(
@@ -1081,32 +1175,55 @@ fn apply_training_config_dict(
     if let Some(value) = config_pair_usize(Some(dict), "grid")? {
         config.grid = value;
     }
-    if let Some(value) = config_pair_usize(Some(dict), "patch_size")? {
+    if let Some(value) = config_pair_usize(Some(dict), "patch_size")?
+        .or(config_pair_usize(Some(dict), "train_patch_size")?)
+    {
         config.patch_size = value;
     }
-    if let Some(value) = config_usize(Some(dict), "batch_size")? {
+    if let Some(value) =
+        config_usize(Some(dict), "batch_size")?.or(config_usize(Some(dict), "train_batch_size")?)
+    {
         config.batch_size = value;
     }
-    if let Some(value) = config_usize(Some(dict), "epochs")? {
+    if let Some(value) =
+        config_usize(Some(dict), "epochs")?.or(config_usize(Some(dict), "train_epochs")?)
+    {
         config.epochs = value;
     }
-    if let Some(value) = config_usize(Some(dict), "steps_per_epoch")? {
+    if let Some(value) = config_usize(Some(dict), "steps_per_epoch")?
+        .or(config_usize(Some(dict), "train_steps_per_epoch")?)
+    {
         config.steps_per_epoch = value;
     }
     if let Some(value) = config_usize(Some(dict), "validation_steps")? {
         config.validation_steps = value;
     }
-    if let Some(value) = config_f64(Some(dict), "learning_rate")? {
+    if let Some(value) =
+        config_f64(Some(dict), "learning_rate")?.or(config_f64(Some(dict), "train_learning_rate")?)
+    {
         config.learning_rate = value;
     }
     if let Some(value) = config_f32(Some(dict), "weight_decay")? {
         config.weight_decay = value;
     }
-    if let Some(value) = config_f32(Some(dict), "foreground_probability")? {
+    if let Some(value) = config_f32(Some(dict), "foreground_probability")?
+        .or(config_f32(Some(dict), "train_foreground_only")?)
+    {
         config.foreground_probability = value;
     }
-    if let Some(value) = config_f32(Some(dict), "background_reg")? {
+    if let Some(value) = config_f32(Some(dict), "background_reg")?
+        .or(config_f32(Some(dict), "train_background_reg")?)
+    {
         config.background_reg = value;
+    }
+    if let Some(values) = config_vec_f32(Some(dict), "train_loss_weights")? {
+        if values.len() != 2 {
+            return Err(PyValueError::new_err(
+                "train_loss_weights must have length 2",
+            ));
+        }
+        config.loss_prob_weight = values[0];
+        config.loss_dist_weight = values[1];
     }
     if let Some(value) = config_f32(Some(dict), "loss_prob_weight")? {
         config.loss_prob_weight = value;
@@ -1128,10 +1245,14 @@ fn apply_training_config_dict(
     if let Some(value) = config_usize(Some(dict), "validation_preview_count")? {
         config.validation_preview_count = value;
     }
-    if let Some(value) = config_bool(Some(dict), "shape_completion")? {
+    if let Some(value) = config_bool(Some(dict), "shape_completion")?
+        .or(config_bool(Some(dict), "train_shape_completion")?)
+    {
         config.shape_completion = value;
     }
-    if let Some(value) = config_usize(Some(dict), "completion_crop")? {
+    if let Some(value) = config_usize(Some(dict), "completion_crop")?
+        .or(config_usize(Some(dict), "train_completion_crop")?)
+    {
         config.completion_crop = value;
     }
 
@@ -1289,20 +1410,51 @@ fn parse_label_color_mode_option(value: Option<&str>) -> PyResult<LabelColorMode
     }
 }
 
+fn parse_bool_argument(value: Option<&Bound<'_, PyAny>>, name: &str) -> PyResult<bool> {
+    let Some(value) = value else {
+        return Ok(false);
+    };
+    if value.is_none() {
+        return Ok(false);
+    }
+    if let Ok(value) = value.extract::<bool>() {
+        return Ok(value);
+    }
+    if let Ok(value) = value.extract::<String>() {
+        return match value.to_ascii_lowercase().as_str() {
+            "true" | "1" | "yes" | "y" => Ok(true),
+            "false" | "0" | "no" | "n" => Ok(false),
+            _ => Err(PyValueError::new_err(format!(
+                "{name} string value must be true or false"
+            ))),
+        };
+    }
+    Err(PyValueError::new_err(format!("{name} must be a bool")))
+}
+
 fn config_string(dict: Option<&Bound<'_, PyDict>>, key: &str) -> PyResult<Option<String>> {
     get_config_value(dict, key)
 }
 
 fn config_bool(dict: Option<&Bound<'_, PyDict>>, key: &str) -> PyResult<Option<bool>> {
-    get_config_value(dict, key)
+    let Some(value) = get_config_item(dict, key)? else {
+        return Ok(None);
+    };
+    parse_bool_argument(Some(&value), key).map(Some)
 }
 
 fn config_usize(dict: Option<&Bound<'_, PyDict>>, key: &str) -> PyResult<Option<usize>> {
-    get_config_value(dict, key)
+    let Some(value) = get_config_item(dict, key)? else {
+        return Ok(None);
+    };
+    py_any_to_usize(&value, key).map(Some)
 }
 
 fn config_u64(dict: Option<&Bound<'_, PyDict>>, key: &str) -> PyResult<Option<u64>> {
-    get_config_value(dict, key)
+    let Some(value) = get_config_item(dict, key)? else {
+        return Ok(None);
+    };
+    py_any_to_u64(&value, key).map(Some)
 }
 
 fn config_f32(dict: Option<&Bound<'_, PyDict>>, key: &str) -> PyResult<Option<f32>> {
@@ -1317,13 +1469,196 @@ fn get_config_value<'py, T>(dict: Option<&Bound<'py, PyDict>>, key: &str) -> PyR
 where
     T: FromPyObjectOwned<'py>,
 {
+    let Some(value) = get_config_item(dict, key)? else {
+        return Ok(None);
+    };
+    value.extract::<T>().map(Some).map_err(Into::into)
+}
+
+fn get_config_item<'py>(
+    dict: Option<&Bound<'py, PyDict>>,
+    key: &str,
+) -> PyResult<Option<Bound<'py, PyAny>>> {
     let Some(dict) = dict else {
         return Ok(None);
     };
     let Some(value) = dict.get_item(key)? else {
         return Ok(None);
     };
-    value.extract::<T>().map(Some).map_err(Into::into)
+    if value.is_none() {
+        Ok(None)
+    } else {
+        Ok(Some(value))
+    }
+}
+
+fn py_any_to_usize(value: &Bound<'_, PyAny>, key: &str) -> PyResult<usize> {
+    if let Ok(value) = value.extract::<usize>() {
+        return Ok(value);
+    }
+    let value = value
+        .extract::<f64>()
+        .map_err(|_| PyValueError::new_err(format!("{key} must be an integer")))?;
+    f64_to_usize(value, key)
+}
+
+fn py_any_to_u64(value: &Bound<'_, PyAny>, key: &str) -> PyResult<u64> {
+    if let Ok(value) = value.extract::<u64>() {
+        return Ok(value);
+    }
+    let value = value
+        .extract::<f64>()
+        .map_err(|_| PyValueError::new_err(format!("{key} must be an integer")))?;
+    f64_to_u64(value, key)
+}
+
+fn f64_to_usize(value: f64, key: &str) -> PyResult<usize> {
+    if value.is_finite() && value >= 0.0 && value.fract() == 0.0 && value <= usize::MAX as f64 {
+        Ok(value as usize)
+    } else {
+        Err(PyValueError::new_err(format!(
+            "{key} must be a non-negative integer"
+        )))
+    }
+}
+
+fn f64_to_u64(value: f64, key: &str) -> PyResult<u64> {
+    if value.is_finite() && value >= 0.0 && value.fract() == 0.0 && value <= u64::MAX as f64 {
+        Ok(value as u64)
+    } else {
+        Err(PyValueError::new_err(format!(
+            "{key} must be a non-negative integer"
+        )))
+    }
+}
+
+fn json_get<'a>(value: &'a serde_json::Value, key: &str) -> Option<&'a serde_json::Value> {
+    value.as_object()?.get(key).filter(|value| !value.is_null())
+}
+
+fn json_usize(value: &serde_json::Value, key: &str) -> Result<Option<usize>, StarDistTrainError> {
+    let Some(value) = json_get(value, key) else {
+        return Ok(None);
+    };
+    json_value_to_usize(value, key).map(Some)
+}
+
+fn json_f32(value: &serde_json::Value, key: &str) -> Result<Option<f32>, StarDistTrainError> {
+    let Some(value) = json_get(value, key) else {
+        return Ok(None);
+    };
+    json_value_to_f64(value, key).map(|value| Some(value as f32))
+}
+
+fn json_f64(value: &serde_json::Value, key: &str) -> Result<Option<f64>, StarDistTrainError> {
+    let Some(value) = json_get(value, key) else {
+        return Ok(None);
+    };
+    json_value_to_f64(value, key).map(Some)
+}
+
+fn json_bool(value: &serde_json::Value, key: &str) -> Result<Option<bool>, StarDistTrainError> {
+    let Some(value) = json_get(value, key) else {
+        return Ok(None);
+    };
+    if let Some(value) = value.as_bool() {
+        return Ok(Some(value));
+    }
+    if let Some(value) = value.as_str() {
+        return match value.to_ascii_lowercase().as_str() {
+            "true" | "1" | "yes" | "y" => Ok(Some(true)),
+            "false" | "0" | "no" | "n" => Ok(Some(false)),
+            _ => Err(StarDistTrainError::InvalidConfig(format!(
+                "{key} string value must be true or false"
+            ))),
+        };
+    }
+    Err(StarDistTrainError::InvalidConfig(format!(
+        "{key} must be a boolean"
+    )))
+}
+
+fn json_pair_usize(
+    value: &serde_json::Value,
+    key: &str,
+) -> Result<Option<[usize; 2]>, StarDistTrainError> {
+    let Some(values) = json_vec_usize(value, key)? else {
+        return Ok(None);
+    };
+    if values.len() != 2 {
+        return Err(StarDistTrainError::InvalidConfig(format!(
+            "{key} must have length 2"
+        )));
+    }
+    Ok(Some([values[0], values[1]]))
+}
+
+fn json_vec_usize(
+    value: &serde_json::Value,
+    key: &str,
+) -> Result<Option<Vec<usize>>, StarDistTrainError> {
+    let Some(value) = json_get(value, key) else {
+        return Ok(None);
+    };
+    let Some(values) = value.as_array() else {
+        return Err(StarDistTrainError::InvalidConfig(format!(
+            "{key} must be a list of integers"
+        )));
+    };
+    values
+        .iter()
+        .map(|value| json_value_to_usize(value, key))
+        .collect::<Result<Vec<_>, _>>()
+        .map(Some)
+}
+
+fn json_vec_f32(
+    value: &serde_json::Value,
+    key: &str,
+) -> Result<Option<Vec<f32>>, StarDistTrainError> {
+    let Some(value) = json_get(value, key) else {
+        return Ok(None);
+    };
+    let Some(values) = value.as_array() else {
+        return Err(StarDistTrainError::InvalidConfig(format!(
+            "{key} must be a list of numbers"
+        )));
+    };
+    values
+        .iter()
+        .map(|value| json_value_to_f64(value, key).map(|value| value as f32))
+        .collect::<Result<Vec<_>, _>>()
+        .map(Some)
+}
+
+fn json_value_to_usize(value: &serde_json::Value, key: &str) -> Result<usize, StarDistTrainError> {
+    if let Some(value) = value.as_u64() {
+        return usize::try_from(value).map_err(|_| {
+            StarDistTrainError::InvalidConfig(format!("{key} is too large for this platform"))
+        });
+    }
+    let value = json_value_to_f64(value, key)?;
+    if value.is_finite() && value >= 0.0 && value.fract() == 0.0 && value <= usize::MAX as f64 {
+        Ok(value as usize)
+    } else {
+        Err(StarDistTrainError::InvalidConfig(format!(
+            "{key} must be a non-negative integer"
+        )))
+    }
+}
+
+fn json_value_to_f64(value: &serde_json::Value, key: &str) -> Result<f64, StarDistTrainError> {
+    if let Some(value) = value.as_f64() {
+        return Ok(value);
+    }
+    if let Some(value) = value.as_str() {
+        return value
+            .parse::<f64>()
+            .map_err(|_| StarDistTrainError::InvalidConfig(format!("{key} must be a number")));
+    }
+    Err(StarDistTrainError::InvalidConfig(format!(
+        "{key} must be a number"
+    )))
 }
 
 fn config_pair_usize(dict: Option<&Bound<'_, PyDict>>, key: &str) -> PyResult<Option<[usize; 2]>> {
@@ -1347,11 +1682,33 @@ fn config_pair_f32(dict: Option<&Bound<'_, PyDict>>, key: &str) -> PyResult<Opti
 }
 
 fn config_vec_usize(dict: Option<&Bound<'_, PyDict>>, key: &str) -> PyResult<Option<Vec<usize>>> {
-    get_config_value(dict, key)
+    let Some(value) = get_config_item(dict, key)? else {
+        return Ok(None);
+    };
+    if let Ok(values) = value.extract::<Vec<usize>>() {
+        return Ok(Some(values));
+    }
+    let values = value
+        .extract::<Vec<f64>>()
+        .map_err(|_| PyValueError::new_err(format!("{key} must be a list of integers")))?;
+    values
+        .into_iter()
+        .map(|value| f64_to_usize(value, key))
+        .collect::<PyResult<Vec<_>>>()
+        .map(Some)
 }
 
 fn config_vec_f32(dict: Option<&Bound<'_, PyDict>>, key: &str) -> PyResult<Option<Vec<f32>>> {
-    get_config_value(dict, key)
+    let Some(value) = get_config_item(dict, key)? else {
+        return Ok(None);
+    };
+    if let Ok(values) = value.extract::<Vec<f32>>() {
+        return Ok(Some(values));
+    }
+    let values = value
+        .extract::<Vec<f64>>()
+        .map_err(|_| PyValueError::new_err(format!("{key} must be a list of numbers")))?;
+    Ok(Some(values.into_iter().map(|value| value as f32).collect()))
 }
 
 fn training_plan_to_pydict<'py>(
