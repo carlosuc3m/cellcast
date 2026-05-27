@@ -166,6 +166,24 @@ labels = train.predict_stardist_2d(
 tifffile.imwrite("prediction.tif", labels.astype("uint32"))
 ```
 
+For repeated predictions, load the trained model once and reuse it. The Python
+object owns the Rust model and backend device; when the last Python reference is
+released, Rust drops those resources.
+
+```python
+import tifffile
+import cellcast.training.stardist_2d as train
+
+model = train.load_stardist_2d("artifacts/stardist2d", gpu=True)
+
+for path in ["image_001.tif", "image_002.tif"]:
+    image = tifffile.imread(path)
+    labels = model.predict(image)
+    tifffile.imwrite(path.replace(".tif", "_labels.tif"), labels.astype("uint32"))
+
+del model
+```
+
 For multi-channel inputs, pass `axis` to identify the channel dimension. The
 saved training config controls preprocessing, including percentile
 normalization and thresholds, unless `prob_threshold` or `nms_threshold` are

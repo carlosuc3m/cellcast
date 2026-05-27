@@ -1,17 +1,18 @@
 use std::path::PathBuf;
 
 use burn::tensor::backend::Backend;
+use cellcast::networks::stardist::trainable_2d::TrainableStarDist2D;
 use cellcast::training::io_2d::{
     load_training_dataset_from_folder_with_options,
     load_training_samples_from_folders_with_options, split_train_valid_2d, FolderDatasetOptions2D,
     ImageChannels2D, LabelColorMode2D,
 };
 use cellcast::training::stardist_2d::{
-    load_stardist_2d, predict_stardist_2d_with_thresholds, save_stardist_2d,
-    train_stardist_2d_with_callbacks, AugmentConfig2D, CpuInferBackend, CpuTrainBackend,
-    EpochEndEvent2D, EpochMetrics, LearningRateSchedule2D, Normalization2D, StarDistTrainError,
-    StepMetrics2D, TrainingCallbacks2D, TrainingConfig2D, TrainingPlan2D, TrainingResult2D,
-    TrainingSample2D, ValidationPreview2D, WgpuInferBackend, WgpuTrainBackend,
+    load_stardist_2d as load_stardist_2d_artifacts, predict_stardist_2d_with_thresholds,
+    save_stardist_2d, train_stardist_2d_with_callbacks, AugmentConfig2D, CpuInferBackend,
+    CpuTrainBackend, EpochEndEvent2D, EpochMetrics, LearningRateSchedule2D, Normalization2D,
+    StarDistTrainError, StepMetrics2D, TrainingCallbacks2D, TrainingConfig2D, TrainingPlan2D,
+    TrainingResult2D, TrainingSample2D, ValidationPreview2D, WgpuInferBackend, WgpuTrainBackend,
 };
 use numpy::ndarray::{Array2, Array3, ArrayView2, ArrayView3};
 use numpy::{IntoPyArray, PyArray2, PyReadonlyArray2, PyReadonlyArray3};
@@ -38,6 +39,122 @@ struct PythonTrainingCallbacks2D {
     on_train_begin: Option<Py<PyAny>>,
     on_step_end: Option<Py<PyAny>>,
     on_validation_end: Option<Py<PyAny>>,
+}
+
+enum LoadedStarDist2DModel {
+    Cpu {
+        model: TrainableStarDist2D<CpuInferBackend>,
+        config: TrainingConfig2D,
+        device: <CpuInferBackend as Backend>::Device,
+    },
+    Wgpu {
+        model: TrainableStarDist2D<WgpuInferBackend>,
+        config: TrainingConfig2D,
+        device: <WgpuInferBackend as Backend>::Device,
+    },
+}
+
+/// Loaded StarDist2D model for repeated Python inference.
+///
+/// Delete the Python object to release the Rust model and backend resources:
+/// `del model`.
+#[pyclass(name = "StarDist2DModel", unsendable)]
+pub struct PyStarDist2DModel {
+    inner: LoadedStarDist2DModel,
+}
+
+#[pymethods]
+impl PyStarDist2DModel {
+    #[pyo3(signature = (data, prob_threshold=None, nms_threshold=None, axis=None))]
+    pub fn predict<'py>(
+        &self,
+        py: Python<'py>,
+        data: Bound<'py, PyAny>,
+        prob_threshold: Option<f32>,
+        nms_threshold: Option<f32>,
+        axis: Option<usize>,
+    ) -> PyResult<Bound<'py, PyArray2<u64>>> {
+        let image = py_image_to_channel_first(&data, axis)?;
+        let labels = self
+            .inner
+            .predict(&image, prob_threshold, nms_threshold)
+            .map_err(stardist_train_error_to_pyerr)?;
+        Ok(labels.into_pyarray(py))
+    }
+
+    #[getter]
+    pub fn gpu(&self) -> bool {
+        matches!(self.inner, LoadedStarDist2DModel::Wgpu { .. })
+    }
+
+    #[getter]
+    pub fn n_channel_in(&self) -> usize {
+        self.inner.config().n_channel_in
+    }
+
+    #[getter]
+    pub fn n_rays(&self) -> usize {
+        self.inner.config().n_rays
+    }
+
+    #[getter]
+    pub fn grid(&self) -> [usize; 2] {
+        self.inner.config().grid
+    }
+
+    pub fn config<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        training_config_to_pydict(py, self.inner.config())
+    }
+}
+
+impl LoadedStarDist2DModel {
+    fn config(&self) -> &TrainingConfig2D {
+        match self {
+            Self::Cpu { config, .. } | Self::Wgpu { config, .. } => config,
+        }
+    }
+
+    fn predict(
+        &self,
+        image: &Array3<f32>,
+        prob_threshold: Option<f32>,
+        nms_threshold: Option<f32>,
+    ) -> Result<Array2<u64>, StarDistTrainError> {
+        match self {
+            Self::Cpu {
+                model,
+                config,
+                device,
+            } => {
+                let prob_threshold = prob_threshold.unwrap_or(config.prob_threshold);
+                let nms_threshold = nms_threshold.unwrap_or(config.nms_threshold);
+                predict_stardist_2d_with_thresholds(
+                    model,
+                    image,
+                    config,
+                    prob_threshold,
+                    nms_threshold,
+                    device,
+                )
+            }
+            Self::Wgpu {
+                model,
+                config,
+                device,
+            } => {
+                let prob_threshold = prob_threshold.unwrap_or(config.prob_threshold);
+                let nms_threshold = nms_threshold.unwrap_or(config.nms_threshold);
+                predict_stardist_2d_with_thresholds(
+                    model,
+                    image,
+                    config,
+                    prob_threshold,
+                    nms_threshold,
+                    device,
+                )
+            }
+        }
+    }
 }
 
 impl PythonTrainingCallbacks2D {
@@ -276,6 +393,40 @@ pub fn predict_stardist_2d_saved<'py>(
     Ok(labels.into_pyarray(py))
 }
 
+/// Load a trained StarDist2D model once for repeated inference.
+///
+/// The returned object owns the Rust model and backend device. When Python
+/// releases the last reference to the object, Rust drops those resources.
+#[pyfunction]
+#[pyo3(name = "load_stardist_2d")]
+#[pyo3(signature = (model_dir, gpu=None))]
+pub fn load_stardist_2d_saved(model_dir: String, gpu: Option<bool>) -> PyResult<PyStarDist2DModel> {
+    if gpu.unwrap_or(false) {
+        let device = Default::default();
+        let (model, config) =
+            load_stardist_2d_artifacts::<WgpuInferBackend, _>(&model_dir, &device)
+                .map_err(stardist_train_error_to_pyerr)?;
+        Ok(PyStarDist2DModel {
+            inner: LoadedStarDist2DModel::Wgpu {
+                model,
+                config,
+                device,
+            },
+        })
+    } else {
+        let device = Default::default();
+        let (model, config) = load_stardist_2d_artifacts::<CpuInferBackend, _>(&model_dir, &device)
+            .map_err(stardist_train_error_to_pyerr)?;
+        Ok(PyStarDist2DModel {
+            inner: LoadedStarDist2DModel::Cpu {
+                model,
+                config,
+                device,
+            },
+        })
+    }
+}
+
 /// Alias for clarity when calling from Python.
 #[pyfunction]
 #[pyo3(name = "predict_trained_stardist_2d")]
@@ -358,7 +509,7 @@ where
     B::Device: Default,
 {
     let device = Default::default();
-    let (model, config) = load_stardist_2d::<B, _>(model_dir, &device)?;
+    let (model, config) = load_stardist_2d_artifacts::<B, _>(model_dir, &device)?;
     let prob_threshold = prob_threshold.unwrap_or(config.prob_threshold);
     let nms_threshold = nms_threshold.unwrap_or(config.nms_threshold);
     predict_stardist_2d_with_thresholds(

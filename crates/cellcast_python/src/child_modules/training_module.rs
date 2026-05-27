@@ -18,9 +18,14 @@ pub fn register_training_module(parent_module: &Bound<'_, PyModule>) -> PyResult
         &stardist_2d_module
     )?)?;
     stardist_2d_module.add_function(wrap_pyfunction!(
+        training_functions::load_stardist_2d_saved,
+        &stardist_2d_module
+    )?)?;
+    stardist_2d_module.add_function(wrap_pyfunction!(
         training_functions::predict_trained_stardist_2d,
         &stardist_2d_module
     )?)?;
+    stardist_2d_module.add_class::<training_functions::PyStarDist2DModel>()?;
     training_module.add_submodule(&stardist_2d_module)?;
     parent_module.add_submodule(&training_module)
 }
