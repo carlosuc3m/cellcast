@@ -239,8 +239,8 @@ labels = model.predict(batch_bcyx)
 ```
 
 For 4D input, the only accepted layout is `[B, C, Y, X]`; omit `axis` or pass
-`axis=1`. Batch prediction currently runs StarDist postprocessing per image, so
-it is mainly an API convenience and does not yet batch NMS.
+`axis=1`. Batch prediction runs the Burn model forward pass once for the full
+batch, then runs StarDist NMS and label rendering per image.
 
 The saved training config controls preprocessing, including percentile
 normalization and thresholds. You can change persistent thresholds through

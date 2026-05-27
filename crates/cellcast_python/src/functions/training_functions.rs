@@ -11,13 +11,14 @@ use cellcast::training::io_2d::{
     ImageChannels2D, LabelColorMode2D,
 };
 use cellcast::training::stardist_2d::{
-    predict_stardist_2d_with_thresholds, save_stardist_2d, train_stardist_2d_with_callbacks,
-    AugmentConfig2D, CpuInferBackend, CpuTrainBackend, EpochEndEvent2D, EpochMetrics,
-    LearningRateSchedule2D, Normalization2D, PythonStarDist2DConfig, PythonThresholds,
-    StarDistTrainError, StepMetrics2D, TrainingCallbacks2D, TrainingConfig2D, TrainingPlan2D,
-    TrainingResult2D, TrainingSample2D, ValidationPreview2D, WgpuInferBackend, WgpuTrainBackend,
+    predict_stardist_2d_batch_with_thresholds, predict_stardist_2d_with_thresholds,
+    save_stardist_2d, train_stardist_2d_with_callbacks, AugmentConfig2D, CpuInferBackend,
+    CpuTrainBackend, EpochEndEvent2D, EpochMetrics, LearningRateSchedule2D, Normalization2D,
+    PythonStarDist2DConfig, PythonThresholds, StarDistTrainError, StepMetrics2D,
+    TrainingCallbacks2D, TrainingConfig2D, TrainingPlan2D, TrainingResult2D, TrainingSample2D,
+    ValidationPreview2D, WgpuInferBackend, WgpuTrainBackend,
 };
-use numpy::ndarray::{s, Array2, Array3, Array4, ArrayView2, ArrayView3, ArrayView4};
+use numpy::ndarray::{Array2, Array3, Array4, ArrayView2, ArrayView3, ArrayView4};
 use numpy::{IntoPyArray, PyReadonlyArray2, PyReadonlyArray3, PyReadonlyArray4};
 use pyo3::exceptions::PyTypeError;
 use pyo3::exceptions::PyValueError;
@@ -873,32 +874,14 @@ where
             Ok(PyPredictionOutput2D::Single(labels))
         }
         PyImageInput2D::BatchBcyx(batch) => {
-            let (batch_size, channels, height, width) = batch.dim();
-            if batch_size == 0 {
-                return Err(StarDistTrainError::Shape(
-                    "batch dimension must be positive".to_string(),
-                ));
-            }
-            let mut labels = Array3::<u64>::zeros((batch_size, height, width));
-            for batch_index in 0..batch_size {
-                let image = batch.slice(s![batch_index, .., .., ..]).to_owned();
-                if image.dim() != (channels, height, width) {
-                    return Err(StarDistTrainError::Shape(
-                        "all batch entries must have the same [C, Y, X] shape".to_string(),
-                    ));
-                }
-                let prediction = predict_stardist_2d_with_thresholds(
-                    model,
-                    &image,
-                    config,
-                    prob_threshold,
-                    nms_threshold,
-                    device,
-                )?;
-                labels
-                    .slice_mut(s![batch_index, .., ..])
-                    .assign(&prediction);
-            }
+            let labels = predict_stardist_2d_batch_with_thresholds(
+                model,
+                batch,
+                config,
+                prob_threshold,
+                nms_threshold,
+                device,
+            )?;
             Ok(PyPredictionOutput2D::Batch(labels))
         }
     }

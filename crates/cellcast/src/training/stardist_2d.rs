@@ -23,7 +23,7 @@ use burn::optim::{AdamWConfig, GradientsParams, Optimizer};
 use burn::prelude::*;
 use burn::record::{CompactRecorder, RecorderError};
 use burn::tensor::backend::{AutodiffBackend, Backend};
-use ndarray::{Array2, Array3};
+use ndarray::{Array2, Array3, Array4};
 use rand::prelude::*;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -1151,6 +1151,39 @@ pub fn predict_stardist_2d_with_thresholds<B: Backend<FloatElem = f32, IntElem =
     ))
 }
 
+/// Run trained-model inference for a batch of same-size channel-first images.
+///
+/// The neural network forward pass is batched as `[batch, channel, y, x]`.
+/// StarDist NMS and label rendering are still applied independently per image.
+pub fn predict_stardist_2d_batch_with_thresholds<B: Backend<FloatElem = f32, IntElem = i32>>(
+    model: &TrainableStarDist2D<B>,
+    images: &Array4<f32>,
+    config: &TrainingConfig2D,
+    prob_threshold: f32,
+    nms_threshold: f32,
+    device: &B::Device,
+) -> Result<Array3<u64>, StarDistTrainError> {
+    let predictions = predict_stardist_2d_batch_raw(model, images, config, device)?;
+    let (batch_size, _, height, width) = images.dim();
+    let mut labels = Array3::<u64>::zeros((batch_size, height, width));
+    for (batch_index, prediction) in predictions.into_iter().enumerate() {
+        let label_image = labels_from_prob_dist_2d(
+            prediction.prob,
+            prediction.dist,
+            prob_threshold,
+            nms_threshold,
+            config.grid,
+            (height, width),
+        );
+        for y in 0..height {
+            for x in 0..width {
+                labels[[batch_index, y, x]] = label_image[[y, x]];
+            }
+        }
+    }
+    Ok(labels)
+}
+
 /// Run trained-model inference and return dense probability and distance maps.
 pub fn predict_stardist_2d_raw<B: Backend<FloatElem = f32, IntElem = i32>>(
     model: &TrainableStarDist2D<B>,
@@ -1206,6 +1239,114 @@ pub fn predict_stardist_2d_raw<B: Backend<FloatElem = f32, IntElem = i32>>(
         prob: prob_arr,
         dist: dist_arr,
     })
+}
+
+/// Run batched trained-model inference and return dense probability/distance
+/// maps for each image before NMS.
+pub fn predict_stardist_2d_batch_raw<B: Backend<FloatElem = f32, IntElem = i32>>(
+    model: &TrainableStarDist2D<B>,
+    images: &Array4<f32>,
+    config: &TrainingConfig2D,
+    device: &B::Device,
+) -> Result<Vec<Prediction2D>, StarDistTrainError> {
+    config.validate()?;
+    let (batch_size, channels, height, width) = images.dim();
+    if batch_size == 0 {
+        return Err(StarDistTrainError::Shape(
+            "batch dimension must be positive".to_string(),
+        ));
+    }
+    if height == 0 || width == 0 {
+        return Err(StarDistTrainError::Shape(
+            "image height and width must be positive".to_string(),
+        ));
+    }
+    if channels != config.n_channel_in {
+        return Err(StarDistTrainError::Shape(format!(
+            "expected {} channels, got {}",
+            config.n_channel_in, channels
+        )));
+    }
+
+    let padded_h = height + (16 - (height % 16)) % 16;
+    let padded_w = width + (16 - (width % 16)) % 16;
+    let mut input_batch = Array4::<f32>::zeros((batch_size, channels, padded_h, padded_w));
+    for batch_index in 0..batch_size {
+        let mut image = Array3::<f32>::zeros((channels, height, width));
+        for c in 0..channels {
+            for y in 0..height {
+                for x in 0..width {
+                    image[[c, y, x]] = images[[batch_index, c, y, x]];
+                }
+            }
+        }
+        let normalized = normalize_image(&image, config.normalization);
+        let padded = reflect_pad_to_divisible(&normalized, 16);
+        let (_, actual_h, actual_w) = padded.dim();
+        if actual_h != padded_h || actual_w != padded_w {
+            return Err(StarDistTrainError::Shape(
+                "all batch entries must pad to the same spatial shape".to_string(),
+            ));
+        }
+        for c in 0..channels {
+            for y in 0..padded_h {
+                for x in 0..padded_w {
+                    input_batch[[batch_index, c, y, x]] = padded[[c, y, x]];
+                }
+            }
+        }
+    }
+
+    let (raw, _) = input_batch.into_raw_vec_and_offset();
+    let input = Tensor::<B, 4>::from_data(
+        TensorData::new(raw, [batch_size, channels, padded_h, padded_w]),
+        device,
+    );
+    let (prob, dist) = model.forward(input);
+    let prob_dims = prob.dims();
+    let dist_dims = dist.dims();
+    if prob_dims[0] != batch_size || prob_dims[1] != 1 {
+        return Err(StarDistTrainError::Shape(format!(
+            "prob output shape is incompatible with batch input: {:?}",
+            prob_dims
+        )));
+    }
+    let out_h = prob_dims[2];
+    let out_w = prob_dims[3];
+    if dist_dims[0] != batch_size
+        || dist_dims[1] != config.n_rays
+        || dist_dims[2] != out_h
+        || dist_dims[3] != out_w
+    {
+        return Err(StarDistTrainError::Shape(format!(
+            "prob/dist output shapes are incompatible: {:?} vs {:?}",
+            prob_dims, dist_dims
+        )));
+    }
+
+    let prob_vec = prob.into_data().into_vec().unwrap();
+    let dist_vec = dist.into_data().into_vec().unwrap();
+    let mut predictions = Vec::with_capacity(batch_size);
+    for batch_index in 0..batch_size {
+        let mut prob_arr = Array2::<f32>::zeros((out_h, out_w));
+        let mut dist_arr = Array3::<f32>::zeros((out_h, out_w, config.n_rays));
+        for y in 0..out_h {
+            for x in 0..out_w {
+                let prob_idx = (batch_index * out_h + y) * out_w + x;
+                prob_arr[[y, x]] = prob_vec[prob_idx];
+                for ray in 0..config.n_rays {
+                    let dist_idx = (((batch_index * config.n_rays + ray) * out_h) + y) * out_w + x;
+                    dist_arr[[y, x, ray]] = dist_vec[dist_idx];
+                }
+            }
+        }
+        predictions.push(Prediction2D {
+            prob: prob_arr,
+            dist: dist_arr,
+        });
+    }
+
+    Ok(predictions)
 }
 
 /// Optimize probability and NMS thresholds on validation samples.
