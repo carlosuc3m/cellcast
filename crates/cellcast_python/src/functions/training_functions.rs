@@ -8,18 +8,18 @@ use burn::tensor::backend::Backend;
 use cellcast::models::stardist_2d::labels_from_prob_dist_2d;
 use cellcast::networks::stardist::trainable_2d::{TrainableStarDist2D, TrainableStarDist2DConfig};
 use cellcast::training::io_2d::{
+    FolderDatasetOptions2D, ImageChannels2D, LabelColorMode2D,
     load_training_dataset_from_folder_with_options,
-    load_training_samples_from_folders_with_options, split_train_valid_2d, FolderDatasetOptions2D,
-    ImageChannels2D, LabelColorMode2D,
+    load_training_samples_from_folders_with_options, split_train_valid_2d,
 };
 use cellcast::training::stardist_2d::{
+    AugmentConfig2D, CpuInferBackend, CpuTrainBackend, EpochEndEvent2D, EpochMetrics,
+    LearningRateSchedule2D, Normalization2D, PythonStarDist2DConfig, PythonThresholds,
+    StarDistTrainError, StepMetrics2D, TrainingCallbacks2D, TrainingConfig2D, TrainingPlan2D,
+    TrainingResult2D, TrainingSample2D, ValidationPreview2D, WgpuInferBackend, WgpuTrainBackend,
     predict_stardist_2d_batch_raw, predict_stardist_2d_batch_with_thresholds,
     predict_stardist_2d_raw, predict_stardist_2d_with_thresholds, save_stardist_2d,
-    train_stardist_2d_with_callbacks, AugmentConfig2D, CpuInferBackend, CpuTrainBackend,
-    EpochEndEvent2D, EpochMetrics, LearningRateSchedule2D, Normalization2D, PythonStarDist2DConfig,
-    PythonThresholds, StarDistTrainError, StepMetrics2D, TrainingCallbacks2D, TrainingConfig2D,
-    TrainingPlan2D, TrainingResult2D, TrainingSample2D, ValidationPreview2D, WgpuInferBackend,
-    WgpuTrainBackend,
+    train_stardist_2d_with_callbacks,
 };
 use numpy::ndarray::{Array2, Array3, Array4, ArrayView2, ArrayView3, ArrayView4};
 use numpy::{IntoPyArray, PyReadonlyArray2, PyReadonlyArray3, PyReadonlyArray4};
@@ -104,7 +104,7 @@ pub struct PyStarDist2DModel {
 
 #[pymethods]
 impl PyStarDist2DModel {
-    #[pyo3(signature = (data, prob_threshold=None, nms_threshold=None, axis=None))]
+    #[pyo3(signature = (data, prob_threshold=None, nms_threshold=None, axis=None, normalization=None))]
     pub fn predict<'py>(
         &self,
         py: Python<'py>,
@@ -112,11 +112,12 @@ impl PyStarDist2DModel {
         prob_threshold: Option<f32>,
         nms_threshold: Option<f32>,
         axis: Option<usize>,
+        normalization: Option<bool>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let input = py_image_input_2d(&data, axis)?;
         let inner = self.lock_inner()?;
         let output = inner
-            .predict_input(&input, prob_threshold, nms_threshold)
+            .predict_input(&input, prob_threshold, nms_threshold, normalization)
             .map_err(stardist_train_error_to_pyerr)?;
         drop(inner);
         Ok(prediction_output_to_py(py, output))
@@ -128,17 +129,18 @@ impl PyStarDist2DModel {
     /// `[grid_y, grid_x]` and `[grid_y, grid_x, n_rays]`. Batch input in
     /// `[B, C, Y, X]` returns `[B, grid_y, grid_x]` and
     /// `[B, grid_y, grid_x, n_rays]`.
-    #[pyo3(signature = (data, axis=None))]
+    #[pyo3(signature = (data, axis=None, normalization=None))]
     pub fn predict_raw<'py>(
         &self,
         py: Python<'py>,
         data: Bound<'py, PyAny>,
         axis: Option<usize>,
+        normalization: Option<bool>,
     ) -> PyResult<Bound<'py, PyTuple>> {
         let input = py_image_input_2d(&data, axis)?;
         let inner = self.lock_inner()?;
         let output = inner
-            .predict_raw_input(&input)
+            .predict_raw_input(&input, normalization)
             .map_err(stardist_train_error_to_pyerr)?;
         drop(inner);
         raw_prediction_output_to_py(py, output)
@@ -247,6 +249,7 @@ impl LoadedStarDist2DModel {
         input: &PyImageInput2D,
         prob_threshold: Option<f32>,
         nms_threshold: Option<f32>,
+        normalization: Option<bool>,
     ) -> Result<PyPredictionOutput2D, StarDistTrainError> {
         match self {
             Self::Cpu {
@@ -263,6 +266,7 @@ impl LoadedStarDist2DModel {
                     input,
                     prob_threshold,
                     nms_threshold,
+                    normalization,
                 )
             }
             Self::Wgpu {
@@ -279,6 +283,7 @@ impl LoadedStarDist2DModel {
                     input,
                     prob_threshold,
                     nms_threshold,
+                    normalization,
                 )
             }
         }
@@ -287,18 +292,19 @@ impl LoadedStarDist2DModel {
     fn predict_raw_input(
         &self,
         input: &PyImageInput2D,
+        normalization: Option<bool>,
     ) -> Result<PyRawPredictionOutput2D, StarDistTrainError> {
         match self {
             Self::Cpu {
                 model,
                 config,
                 device,
-            } => predict_raw_with_model_input(model, config, device, input),
+            } => predict_raw_with_model_input(model, config, device, input, normalization),
             Self::Wgpu {
                 model,
                 config,
                 device,
-            } => predict_raw_with_model_input(model, config, device, input),
+            } => predict_raw_with_model_input(model, config, device, input, normalization),
         }
     }
 }
@@ -520,7 +526,8 @@ pub fn train_stardist_2d_folder<'py>(
     prob_threshold=None,
     nms_threshold=None,
     axis=None,
-    gpu=None
+    gpu=None,
+    normalization=None
 ))]
 pub fn predict_stardist_2d_saved<'py>(
     py: Python<'py>,
@@ -530,6 +537,7 @@ pub fn predict_stardist_2d_saved<'py>(
     nms_threshold: Option<f32>,
     axis: Option<usize>,
     gpu: Option<bool>,
+    normalization: Option<bool>,
 ) -> PyResult<Bound<'py, PyAny>> {
     let input = py_image_input_2d(&data, axis)?;
     let use_gpu = gpu.unwrap_or(false);
@@ -541,6 +549,7 @@ pub fn predict_stardist_2d_saved<'py>(
                     &input,
                     prob_threshold,
                     nms_threshold,
+                    normalization,
                 )
             } else {
                 predict_saved_backend::<CpuInferBackend>(
@@ -548,6 +557,7 @@ pub fn predict_stardist_2d_saved<'py>(
                     &input,
                     prob_threshold,
                     nms_threshold,
+                    normalization,
                 )
             }
         })
@@ -626,7 +636,8 @@ pub fn load_stardist_2d_saved(
     prob_threshold=None,
     nms_threshold=None,
     axis=None,
-    gpu=None
+    gpu=None,
+    normalization=None
 ))]
 pub fn predict_trained_stardist_2d<'py>(
     py: Python<'py>,
@@ -636,6 +647,7 @@ pub fn predict_trained_stardist_2d<'py>(
     nms_threshold: Option<f32>,
     axis: Option<usize>,
     gpu: Option<bool>,
+    normalization: Option<bool>,
 ) -> PyResult<Bound<'py, PyAny>> {
     predict_stardist_2d_saved(
         py,
@@ -645,6 +657,7 @@ pub fn predict_trained_stardist_2d<'py>(
         nms_threshold,
         axis,
         gpu,
+        normalization,
     )
 }
 
@@ -957,6 +970,7 @@ fn predict_saved_backend<B>(
     input: &PyImageInput2D,
     prob_threshold: Option<f32>,
     nms_threshold: Option<f32>,
+    normalization: Option<bool>,
 ) -> Result<PyPredictionOutput2D, StarDistTrainError>
 where
     B: Backend<FloatElem = f32, IntElem = i32>,
@@ -974,6 +988,7 @@ where
         input,
         prob_threshold,
         nms_threshold,
+        normalization,
     )
 }
 
@@ -984,16 +999,18 @@ fn predict_with_model_input<B>(
     input: &PyImageInput2D,
     prob_threshold: f32,
     nms_threshold: f32,
+    normalization: Option<bool>,
 ) -> Result<PyPredictionOutput2D, StarDistTrainError>
 where
     B: Backend<FloatElem = f32, IntElem = i32>,
 {
+    let config = inference_config_with_normalization(config, normalization);
     match input {
         PyImageInput2D::Single(image) => {
             let labels = predict_stardist_2d_with_thresholds(
                 model,
                 image,
-                config,
+                &config,
                 prob_threshold,
                 nms_threshold,
                 device,
@@ -1004,7 +1021,7 @@ where
             let labels = predict_stardist_2d_batch_with_thresholds(
                 model,
                 batch,
-                config,
+                &config,
                 prob_threshold,
                 nms_threshold,
                 device,
@@ -1019,23 +1036,36 @@ fn predict_raw_with_model_input<B>(
     config: &TrainingConfig2D,
     device: &B::Device,
     input: &PyImageInput2D,
+    normalization: Option<bool>,
 ) -> Result<PyRawPredictionOutput2D, StarDistTrainError>
 where
     B: Backend<FloatElem = f32, IntElem = i32>,
 {
+    let config = inference_config_with_normalization(config, normalization);
     match input {
         PyImageInput2D::Single(image) => {
-            let prediction = predict_stardist_2d_raw(model, image, config, device)?;
+            let prediction = predict_stardist_2d_raw(model, image, &config, device)?;
             Ok(PyRawPredictionOutput2D::Single {
                 prob: prediction.prob,
                 dist: prediction.dist,
             })
         }
         PyImageInput2D::BatchBcyx(batch) => {
-            let predictions = predict_stardist_2d_batch_raw(model, batch, config, device)?;
+            let predictions = predict_stardist_2d_batch_raw(model, batch, &config, device)?;
             predictions_to_raw_batch(predictions, config.n_rays)
         }
     }
+}
+
+fn inference_config_with_normalization(
+    config: &TrainingConfig2D,
+    normalization: Option<bool>,
+) -> TrainingConfig2D {
+    let mut config = config.clone();
+    if matches!(normalization, Some(false)) {
+        config.normalization = Normalization2D::None;
+    }
+    config
 }
 
 fn prediction_output_to_py<'py>(
