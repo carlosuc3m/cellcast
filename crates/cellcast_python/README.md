@@ -169,6 +169,9 @@ tifffile.imwrite("prediction.tif", labels.astype("uint32"))
 For repeated predictions, load the trained model once and reuse it. The Python
 object owns the Rust model and backend device; when the last Python reference is
 released, Rust drops those resources.
+The model object may be used from different Python worker threads. Calls on the
+same object are serialized internally, so concurrent tasks share one loaded
+model safely but do not run inference through that object in parallel.
 
 ```python
 import tifffile

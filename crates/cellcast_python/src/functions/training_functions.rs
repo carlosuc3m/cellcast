@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use burn::module::Module;
 use burn::record::CompactRecorder;
@@ -96,9 +97,9 @@ enum LoadedStarDist2DModel {
 ///
 /// Delete the Python object to release the Rust model and backend resources:
 /// `del model`.
-#[pyclass(name = "StarDist2DModel", unsendable)]
+#[pyclass(name = "StarDist2DModel")]
 pub struct PyStarDist2DModel {
-    inner: LoadedStarDist2DModel,
+    inner: Arc<Mutex<LoadedStarDist2DModel>>,
 }
 
 #[pymethods]
@@ -113,10 +114,11 @@ impl PyStarDist2DModel {
         axis: Option<usize>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let input = py_image_input_2d(&data, axis)?;
-        let output = self
-            .inner
+        let inner = self.lock_inner()?;
+        let output = inner
             .predict_input(&input, prob_threshold, nms_threshold)
             .map_err(stardist_train_error_to_pyerr)?;
+        drop(inner);
         Ok(prediction_output_to_py(py, output))
     }
 
@@ -134,76 +136,96 @@ impl PyStarDist2DModel {
         axis: Option<usize>,
     ) -> PyResult<Bound<'py, PyTuple>> {
         let input = py_image_input_2d(&data, axis)?;
-        let output = self
-            .inner
+        let inner = self.lock_inner()?;
+        let output = inner
             .predict_raw_input(&input)
             .map_err(stardist_train_error_to_pyerr)?;
+        drop(inner);
         raw_prediction_output_to_py(py, output)
     }
 
     #[getter]
-    pub fn gpu(&self) -> bool {
-        matches!(self.inner, LoadedStarDist2DModel::Wgpu { .. })
+    pub fn gpu(&self) -> PyResult<bool> {
+        Ok(matches!(
+            &*self.lock_inner()?,
+            LoadedStarDist2DModel::Wgpu { .. }
+        ))
     }
 
     #[getter]
-    pub fn n_channel_in(&self) -> usize {
-        self.inner.config().n_channel_in
+    pub fn n_channel_in(&self) -> PyResult<usize> {
+        Ok(self.lock_inner()?.config().n_channel_in)
     }
 
     #[getter]
-    pub fn n_rays(&self) -> usize {
-        self.inner.config().n_rays
+    pub fn n_rays(&self) -> PyResult<usize> {
+        Ok(self.lock_inner()?.config().n_rays)
     }
 
     #[getter]
-    pub fn grid(&self) -> [usize; 2] {
-        self.inner.config().grid
+    pub fn grid(&self) -> PyResult<[usize; 2]> {
+        Ok(self.lock_inner()?.config().grid)
     }
 
     #[getter]
-    pub fn prob_threshold(&self) -> f32 {
-        self.inner.config().prob_threshold
+    pub fn prob_threshold(&self) -> PyResult<f32> {
+        Ok(self.lock_inner()?.config().prob_threshold)
     }
 
     #[setter]
-    pub fn set_prob_threshold(&mut self, value: f32) -> PyResult<()> {
+    pub fn set_prob_threshold(&self, value: f32) -> PyResult<()> {
         validate_threshold("prob_threshold", value)?;
-        self.inner.config_mut().prob_threshold = value;
+        self.lock_inner()?.config_mut().prob_threshold = value;
         Ok(())
     }
 
     #[getter]
-    pub fn nms_threshold(&self) -> f32 {
-        self.inner.config().nms_threshold
+    pub fn nms_threshold(&self) -> PyResult<f32> {
+        Ok(self.lock_inner()?.config().nms_threshold)
     }
 
     #[setter]
-    pub fn set_nms_threshold(&mut self, value: f32) -> PyResult<()> {
+    pub fn set_nms_threshold(&self, value: f32) -> PyResult<()> {
         validate_threshold("nms_threshold", value)?;
-        self.inner.config_mut().nms_threshold = value;
+        self.lock_inner()?.config_mut().nms_threshold = value;
         Ok(())
     }
 
     #[pyo3(signature = (prob_threshold=None, nms_threshold=None))]
     pub fn set_thresholds(
-        &mut self,
+        &self,
         prob_threshold: Option<f32>,
         nms_threshold: Option<f32>,
     ) -> PyResult<()> {
+        let mut inner = self.lock_inner()?;
         if let Some(value) = prob_threshold {
             validate_threshold("prob_threshold", value)?;
-            self.inner.config_mut().prob_threshold = value;
+            inner.config_mut().prob_threshold = value;
         }
         if let Some(value) = nms_threshold {
             validate_threshold("nms_threshold", value)?;
-            self.inner.config_mut().nms_threshold = value;
+            inner.config_mut().nms_threshold = value;
         }
         Ok(())
     }
 
     pub fn config<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        training_config_to_pydict(py, self.inner.config())
+        let inner = self.lock_inner()?;
+        training_config_to_pydict(py, inner.config())
+    }
+}
+
+impl PyStarDist2DModel {
+    fn new(inner: LoadedStarDist2DModel) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(inner)),
+        }
+    }
+
+    fn lock_inner(&self) -> PyResult<MutexGuard<'_, LoadedStarDist2DModel>> {
+        self.inner.lock().map_err(|_| {
+            PyValueError::new_err("StarDist2DModel internal lock is poisoned after a panic")
+        })
     }
 }
 
@@ -573,13 +595,11 @@ pub fn load_stardist_2d_saved(
                     config.as_ref(),
                     &device,
                 )?;
-                Ok(PyStarDist2DModel {
-                    inner: LoadedStarDist2DModel::Wgpu {
-                        model,
-                        config,
-                        device,
-                    },
-                })
+                Ok(PyStarDist2DModel::new(LoadedStarDist2DModel::Wgpu {
+                    model,
+                    config,
+                    device,
+                }))
             } else {
                 let device = Default::default();
                 let (model, config) = load_trained_stardist_2d_backend::<CpuInferBackend>(
@@ -587,13 +607,11 @@ pub fn load_stardist_2d_saved(
                     config.as_ref(),
                     &device,
                 )?;
-                Ok(PyStarDist2DModel {
-                    inner: LoadedStarDist2DModel::Cpu {
-                        model,
-                        config,
-                        device,
-                    },
-                })
+                Ok(PyStarDist2DModel::new(LoadedStarDist2DModel::Cpu {
+                    model,
+                    config,
+                    device,
+                }))
             }
         }
     }
@@ -701,26 +719,22 @@ fn new_stardist_2d_from_config(
         let model_config =
             TrainableStarDist2DConfig::new(config.n_channel_in, config.n_rays, config.grid);
         let model = model_config.init::<WgpuInferBackend>(&device);
-        Ok(PyStarDist2DModel {
-            inner: LoadedStarDist2DModel::Wgpu {
-                model,
-                config,
-                device,
-            },
-        })
+        Ok(PyStarDist2DModel::new(LoadedStarDist2DModel::Wgpu {
+            model,
+            config,
+            device,
+        }))
     } else {
         let device = Default::default();
         CpuInferBackend::seed(&device, config.seed);
         let model_config =
             TrainableStarDist2DConfig::new(config.n_channel_in, config.n_rays, config.grid);
         let model = model_config.init::<CpuInferBackend>(&device);
-        Ok(PyStarDist2DModel {
-            inner: LoadedStarDist2DModel::Cpu {
-                model,
-                config,
-                device,
-            },
-        })
+        Ok(PyStarDist2DModel::new(LoadedStarDist2DModel::Cpu {
+            model,
+            config,
+            device,
+        }))
     }
 }
 
